@@ -69,12 +69,6 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        
-        # ── Echo endpoint for availability check ──────────────────────────────
-        if parsed.path == '/echo':
-            self._plain(200, b'STP Host')
-            return
-        
         if parsed.path != '/proxy':
             self._plain(404, b'Not found')
             return

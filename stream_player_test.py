@@ -1,7 +1,35 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v1.0.2:
+# v2.0.2: all 15 code-review fixes applied.
 #
+# v2.0.1: createCastPlaylist and createMasterPlaylist forward subtitle_tracks to http_server.
+#
+# v1.9 changes:
+#
+# [1] PROXY ON/OFF TRAY TOGGLE
+#     Tray menu now shows a clickable "● HTTP Proxy :8085" / "○ Proxy Off" item.
+#     When Proxy Off:
+#       • createMasterPlaylist — returns the original master URL directly (no session).
+#         The player/TV fetches the CDN stream without going through our server.
+#         Use when the TV/VLC can reach the CDN directly (no auth headers needed).
+#       • createCastPlaylist HLS (use_mpeg_ts=False) — same: original video URL returned.
+#       • createCastPlaylist TS (use_mpeg_ts=True) — always proxied via ffmpeg regardless
+#         of the toggle, because TS muxing requires our server to run ffmpeg.
+#     Proxy is always active; mode (direct/hls/ts) is selected per-domain in JS.
+#
+# [2] REMOVED name != 'ard' FILTER FROM _build_menu
+#     The filter prevented site-specific modules from showing a tray_label() status line.
+#     All loaded modules with is_active() + tray_label() now appear in the menu.
+#
+# v2.0.2 fixes (all from code-review):
+#   #2  _hls_proxy race condition — protected by _hls_proxy_lock
+#   #3  _player_procs dict accessed from 16 worker threads — protected by _player_procs_lock
+#   #4  worker-pool shutdown: only 1 sentinel sent for 16 workers — now sends N
+#   #5  cfg dict mutated concurrently — _cfg_lock (RLock) protects save + discovery writes
+#   #9  hidden imports inside functions — moved to module level (re, importlib, traceback)
+#   #10 _read_exact buf += chunk was O(n²) — replaced with b''.join() (O(n))
+#   #12 open_settings silently swallowed errors — uses top-level traceback
+#   #13 _kill_all_copies leaked OpenProcess handles — CloseHandle added
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -537,6 +565,37 @@ _hls_proxy               = None  # HLSProxy | None — lazy-initialized on first
 # and create two HLSProxy instances, leaking the first one's port binding
 _hls_proxy_lock          = threading.Lock()
 
+# ── Echo server for availability check (Windows only) ─────────────────────────
+
+_echo_server = None  # ThreadingHTTPServer | None
+
+def _start_echo_server(port: int = 8085):
+    """Start a minimal HTTP server that responds to /echo with 'STP Host'."""
+    global _echo_server
+    try:
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+        class EchoHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/echo':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/plain')
+                    self.send_header('Content-Length', '8')
+                    self.end_headers()
+                    self.wfile.write(b'STP Host')
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, fmt, *args):
+                pass  # suppress logging
+
+        _echo_server = ThreadingHTTPServer(('127.0.0.1', port), EchoHandler)
+        threading.Thread(target=_echo_server.serve_forever, daemon=True).start()
+        sys.stderr.write(f'[BG] Echo server started on port {port}\n')
+    except Exception as e:
+        sys.stderr.write(f'[BG] Echo server failed: {e}\n')
+
 _WORKER_COUNT = 16  # named constant used for both spawn and shutdown
 
 def native_host_loop():
@@ -668,6 +727,10 @@ def native_host_loop():
                     _reply({'success': True, **_hls_proxy.get_stats()}, seq)
                 else:
                     _reply({'success': False, 'error': 'Proxy not running'}, seq)
+
+            elif action == 'pingNativeHost':
+                # Extension pings on startup to ensure EXE is running
+                _reply({'success': True, 'echo': 'STP Host'}, seq)
 
             elif action == 'detectVlc':
                 path = _detect_vlc_path()
@@ -1085,6 +1148,9 @@ def main():
         sys.path.insert(0, meipass)
 
     load_config()
+
+    # Start echo server for availability check (Windows)
+    _start_echo_server(8085)
 
     def _is_pipe() -> bool:
         try:
