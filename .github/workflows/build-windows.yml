@@ -24,7 +24,7 @@ jobs:
           pip install pyinstaller pystray pillow
 
       - name: Build EXE
-        run: pyinstaller "Stream-to-Player.spec"
+        run: pyinstaller --noconfirm --clean "Stream-to-Player.spec"
 
       - name: Upload EXE Artifact
         uses: actions/upload-artifact@v4

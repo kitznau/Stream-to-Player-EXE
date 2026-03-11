@@ -1,0 +1,9 @@
+{
+  "name": "stream_player_opener",
+  "description": "Stream to Player native host",
+  "path": "C:\\test\\Stream-to-Player\\EXE\\Stream-to-Player.exe",
+  "type": "stdio",
+  "allowed_extensions": [
+    "{a1b2c3d4-e5f6-7890-abcd-ef1234569000}"
+  ]
+}
