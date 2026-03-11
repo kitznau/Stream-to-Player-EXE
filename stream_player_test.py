@@ -6,16 +6,16 @@
 #
 # v1.9 changes:
 #
-# [1] PROXY ON/OFF TRAY TOGGLE
-#     Tray menu now shows a clickable "● HTTP Proxy :8085" / "○ Proxy Off" item.
-#     When Proxy Off:
+# [1] STP HOST ON/OFF TRAY TOGGLE
+#     Tray menu now shows a clickable "● STP Host :8085" / "○ STP Host Off" item.
+#     When STP Host Off:
 #       • createMasterPlaylist — returns the original master URL directly (no session).
 #         The player/TV fetches the CDN stream without going through our server.
 #         Use when the TV/VLC can reach the CDN directly (no auth headers needed).
 #       • createCastPlaylist HLS (use_mpeg_ts=False) — same: original video URL returned.
 #       • createCastPlaylist TS (use_mpeg_ts=True) — always proxied via ffmpeg regardless
 #         of the toggle, because TS muxing requires our server to run ffmpeg.
-#     Proxy is always active; mode (direct/hls/ts) is selected per-domain in JS.
+#     STP Host is always active; mode (direct/hls/ts) is selected per-domain in JS.
 #
 # [2] REMOVED name != 'ard' FILTER FROM _build_menu
 #     The filter prevented site-specific modules from showing a tray_label() status line.
@@ -726,7 +726,7 @@ def native_host_loop():
                 if _hls_proxy and _hls_proxy.is_running():
                     _reply({'success': True, **_hls_proxy.get_stats()}, seq)
                 else:
-                    _reply({'success': False, 'error': 'Proxy not running'}, seq)
+                    _reply({'success': False, 'error': 'STP Host not running'}, seq)
 
             elif action == 'pingNativeHost':
                 # Extension pings on startup to ensure EXE is running
