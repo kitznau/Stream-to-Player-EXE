@@ -310,10 +310,55 @@ def discover_dlna() -> tuple:
             else ' (no UPnP devices found — check network/firewall)')
     return False, f'DLNA MediaRenderer not found{hint}'
 
-_DLNA_DISCOVER_INTERVAL = 86400
+_DLNA_DISCOVER_INTERVAL = 86400  # Full discovery: 24 hours
+_DLNA_POLL_INTERVAL = 900  # Quick availability check: 15 minutes
 
 # Serialise concurrent dlnaCast / dlnaStop SOAP calls
 _dlna_soap_lock = threading.Lock()
+
+# DLNA availability cache (updated by periodic poll)
+_dlna_available = False
+_dlna_available_lock = threading.Lock()
+
+def _check_dlna_availability():
+    """Quick check if DLNA TV is reachable (called every 15 minutes)."""
+    global _dlna_available
+    ctrl = cfg.get('dlna_control_url', '')
+    if not ctrl:
+        with _dlna_available_lock:
+            _dlna_available = False
+        return False
+    
+    try:
+        # Quick SOAP GetTransportInfo to check if TV responds
+        resp = _soap(ctrl, 'GetTransportInfo',
+            '<u:GetTransportInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+            '<InstanceID>0</InstanceID></u:GetTransportInfo>', timeout=3)
+        
+        # If we get a response, TV is available
+        with _dlna_available_lock:
+            _dlna_available = True
+        return True
+    except Exception:
+        with _dlna_available_lock:
+            _dlna_available = False
+        return False
+
+def _start_dlna_poller():
+    """Start background thread that polls DLNA availability every 30 seconds."""
+    def _poll():
+        while True:
+            time.sleep(_DLNA_POLL_INTERVAL)
+            try:
+                _check_dlna_availability()
+            except Exception:
+                pass
+    threading.Thread(target=_poll, daemon=True).start()
+
+def is_dlna_available():
+    """Return cached DLNA availability status."""
+    with _dlna_available_lock:
+        return _dlna_available
 
 def dlna_cast(cast_url: str, title: str) -> dict:
     ctrl = cfg.get('dlna_control_url', '')
@@ -467,6 +512,8 @@ def _auto_discover_dlna():
                 with _cfg_lock:
                     cfg['dlna_last_discovered'] = time.time()
                 save_config()
+                # Update DLNA availability cache
+                _check_dlna_availability()
         except Exception:
             pass
     threading.Thread(target=_run, daemon=True).start()
@@ -570,7 +617,7 @@ _hls_proxy_lock          = threading.Lock()
 _echo_server = None  # ThreadingHTTPServer | None
 
 def _start_echo_server(port: int = 8085):
-    """Start a minimal HTTP server that responds to /echo with 'STP Host'."""
+    """Start a minimal HTTP server that responds to /echo with JSON status."""
     global _echo_server
     try:
         from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -578,11 +625,20 @@ def _start_echo_server(port: int = 8085):
         class EchoHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path == '/echo':
+                    # Check if DLNA is available (from cached poll result)
+                    dlna_enabled = is_dlna_available()
+                    
+                    response = {
+                        'id': 'STP Host',
+                        'dlnaAvailable': dlna_enabled
+                    }
+                    
+                    response_json = json.dumps(response)
                     self.send_response(200)
-                    self.send_header('Content-Type', 'text/plain')
-                    self.send_header('Content-Length', '8')
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(response_json)))
                     self.end_headers()
-                    self.wfile.write(b'STP Host')
+                    self.wfile.write(response_json.encode('utf-8'))
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -1151,6 +1207,9 @@ def main():
 
     # Start echo server for availability check (Windows)
     _start_echo_server(8085)
+    
+    # Start DLNA poller to check TV availability every 15 minutes
+    _start_dlna_poller()
 
     def _is_pipe() -> bool:
         try:
