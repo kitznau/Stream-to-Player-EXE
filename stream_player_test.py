@@ -285,10 +285,13 @@ def discover_dlna() -> tuple:
     for loc in locations:
         try:
             fname, ctrl_url = _parse_dlna_desc(_fetch_desc(loc), loc)
+            p = urlparse(loc)
             # Fix #5: guard concurrent cfg writes from discovery thread
             with _cfg_lock:
                 cfg['dlna_control_url']   = ctrl_url
                 cfg['dlna_friendly_name'] = fname
+                if p.hostname: cfg['dlna_host'] = p.hostname
+                if p.port:     cfg['dlna_port'] = p.port
             sys.stderr.write(f'[DLNA] DMR found: {fname} @ {ctrl_url}\n')
             return True, fname or 'Device found'
         except Exception as e:
@@ -302,6 +305,9 @@ def discover_dlna() -> tuple:
                 with _cfg_lock:
                     cfg['dlna_control_url']   = ctrl_url
                     cfg['dlna_friendly_name'] = fname
+                    # Also update host/port in case they were partial
+                    cfg['dlna_host'] = host
+                    cfg['dlna_port'] = port
                 return True, fname or 'Device found'
             except Exception:
                 continue
@@ -345,8 +351,14 @@ def _check_dlna_availability():
         return False
 
 def _start_dlna_poller():
-    """Start background thread that polls DLNA availability every 30 seconds."""
+    """Start background thread that polls DLNA availability every 15 minutes."""
     def _poll():
+        # [3.3] Perform immediate check on startup
+        try:
+            _check_dlna_availability()
+        except Exception:
+            pass
+            
         while True:
             time.sleep(_DLNA_POLL_INTERVAL)
             try:
@@ -501,21 +513,34 @@ def get_player_state(player_path: str) -> dict:
         return {'state': 'unknown', 'error': str(e)}
 
 def _auto_discover_dlna():
+    """Background discovery. Skips if already found recently, unless unreachable."""
     last = cfg.get('dlna_last_discovered', 0)
-    if time.time() - last < _DLNA_DISCOVER_INTERVAL and cfg.get('dlna_control_url'):
-        return
+    has_url = bool(cfg.get('dlna_control_url'))
+    
+    # [3.3] If we have a URL, check if it actually works.
+    # If unreachable (TV IP changed or off), trigger rediscovery regardless of time.
+    is_reachable = False
+    if has_url:
+        is_reachable = _check_dlna_availability()
+        
+    if has_url and is_reachable:
+        # Already have a working device, check if 24h interval passed for refresh
+        if time.time() - last < _DLNA_DISCOVER_INTERVAL:
+            return
+
     def _run():
         try:
+            sys.stderr.write('[DLNA] Discovery started...\n')
             ok, info = discover_dlna()
             if ok:
                 # Fix #5: guard concurrent write from this daemon thread
                 with _cfg_lock:
                     cfg['dlna_last_discovered'] = time.time()
                 save_config()
-                # Update DLNA availability cache
+                # Update DLNA availability cache immediately
                 _check_dlna_availability()
-        except Exception:
-            pass
+        except Exception as e:
+            sys.stderr.write(f'[DLNA] Discovery thread error: {e}\n')
     threading.Thread(target=_run, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1208,7 +1233,7 @@ def main():
     # Start echo server for availability check (Windows)
     _start_echo_server(8085)
     
-    # Start DLNA poller to check TV availability every 15 minutes
+    # Start DLNA poller (performs immediate check, then every 15 min)
     _start_dlna_poller()
 
     def _is_pipe() -> bool:
