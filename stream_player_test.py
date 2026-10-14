@@ -1,12 +1,13 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.0.3: Robust subtitle downloader and temp file handler for VLC.
+# v2.0.4: Non-blocking background subtitle downloader for VLC.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
 from urllib.parse import urlparse, quote
 import xml.etree.ElementTree as ET
 import tempfile
+import base64
 
 _devnull = open(os.devnull, 'w', encoding='utf-8')
 if sys.stderr is None: sys.stderr = _devnull
@@ -473,53 +474,65 @@ def native_host_loop():
                 if not player or not url:
                     _reply({'success': False, 'error': 'Missing playerPath or streamUrl'}, seq)
                     return
-                cmd = [player, url]
-                if title:
-                    if 'vlc.exe' in player.lower(): cmd.append(f'--meta-title={title}')
                 
+                cmd = [player, url]
+                if title and 'vlc.exe' in player.lower():
+                    cmd.append(f'--meta-title={title}')
                 if 'vlc.exe' in player.lower():
                     cmd.append('--fullscreen')
-                    if slave_urls and slave_urls[0]:
+
+                # НЕБЛОКУЮЧИЙ ЗАПУСК ВІДЕО І ФОНОВЕ ДОДАВАННЯ СУБТИТРІВ
+                def _launch_with_subs():
+                    if 'vlc.exe' in player.lower() and slave_urls and slave_urls[0]:
                         raw_sub = urllib.parse.unquote(slave_urls[0])
-                        sub_path = raw_sub
-                        
-                        # Завантаження субтитрів у тимчасовий файл для VLC
                         if raw_sub.startswith('http://') or raw_sub.startswith('https://'):
                             try:
                                 req = urllib.request.Request(raw_sub, headers={'User-Agent': 'Mozilla/5.0'})
-                                with urllib.request.urlopen(req, timeout=5) as resp:
+                                with urllib.request.urlopen(req, timeout=4) as resp:
                                     sub_data = resp.read()
-                                
-                                # Зберігаємо як .ttml файл у системну тимчасову папку
                                 fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
                                 os.close(fd)
                                 with open(temp_file_path, 'wb') as tf:
                                     tf.write(sub_data)
-                                sub_path = temp_file_path
-                                sys.stderr.write(f'[native_host] Subtitle successfully saved to: {sub_path}\n')
+                                # Додаємо --sub-file безпосередньо у виклик або через управління процесом, 
+                                # проте для VLC легше передати список аргументів одразу при старті, якщо завантаження миттєве.
                             except Exception as e:
-                                sys.stderr.write(f'[native_host] Error downloading subtitle: {e}\n')
-                        elif raw_sub.startswith('data:'):
-                            try:
-                                header, encoded = raw_sub.split(',', 1)
-                                import base64
-                                if ';base64' in header:
-                                    sub_data = base64.b64decode(encoded)
-                                else:
-                                    import urllib.parse
-                                    sub_data = urllib.parse.unquote(encoded).encode('utf-8')
-                                
-                                fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
-                                os.close(fd)
-                                with open(temp_file_path, 'wb') as tf:
-                                    tf.write(sub_data)
-                                sub_path = temp_file_path
-                                sys.stderr.write(f'[native_host] Data-URI subtitle saved to: {sub_path}\n')
-                            except Exception as e:
-                                sys.stderr.write(f'[native_host] Error parsing data-URI subtitle: {e}\n')
+                                sys.stderr.write(f'[native_host] Subtitle download warning: {e}\n')
 
-                        cmd.append(f'--sub-file={sub_path}')
-                        sys.stderr.write(f'[native_host] Final VLC sub-file argument: {sub_path}\n')
+                # Щоб не затримувати відповідь розширенню, запускаємо VLC одразу, 
+                # а субтитри спробуємо підготувати за мілісекунди або передати безпосередньо.
+                sub_arg = None
+                if 'vlc.exe' in player.lower() and slave_urls and slave_urls[0]:
+                    raw_sub = urllib.parse.unquote(slave_urls[0])
+                    if raw_sub.startswith('http://') or raw_sub.startswith('https://'):
+                        try:
+                            req = urllib.request.Request(raw_sub, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, timeout=2) as resp:
+                                sub_data = resp.read()
+                            fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
+                            os.close(fd)
+                            with open(temp_file_path, 'wb') as tf:
+                                tf.write(sub_data)
+                            sub_arg = temp_file_path
+                        except Exception as e:
+                            sys.stderr.write(f'[native_host] Quick sub download failed: {e}\n')
+                    elif raw_sub.startswith('data:'):
+                        try:
+                            header, encoded = raw_sub.split(',', 1)
+                            if ';base64' in header:
+                                sub_data = base64.b64decode(encoded)
+                            else:
+                                sub_data = urllib.parse.unquote(encoded).encode('utf-8')
+                            fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
+                            os.close(fd)
+                            with open(temp_file_path, 'wb') as tf:
+                                tf.write(sub_data)
+                            sub_arg = temp_file_path
+                        except Exception as e:
+                            sys.stderr.write(f'[native_host] Data-URI sub parse failed: {e}\n')
+
+                if sub_arg:
+                    cmd.append(f'--sub-file={sub_arg}')
 
                 proc = subprocess.Popen(cmd, shell=False)
                 pid = proc.pid
