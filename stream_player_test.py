@@ -477,11 +477,33 @@ def native_host_loop():
                     if 'vlc.exe' in player.lower(): cmd.append(f'--meta-title={title}')
                 if 'vlc.exe' in player.lower():
                     cmd.append('--fullscreen')
-                    # ВИПРАВЛЕНИЙ БЛОК: Декодуємо URL субтитрів через unquote
                     if slave_urls and slave_urls[0]:
-                        sub_url = urllib.parse.unquote(slave_urls[0])
-                        cmd.append(f'--sub-file={sub_url}')
-                        sys.stderr.write(f'[native_host] sub-file: {sub_url}\n')
+                        raw_sub = slave_urls[0]
+                        sub_path = raw_sub
+                        
+                        # Якщо це веб-посилання, завантажуємо його у тимчасовий файлик для VLC
+                        if raw_sub.startswith('http://') or raw_sub.startswith('https://'):
+                            try:
+                                import tempfile
+                                req = urllib.request.Request(raw_sub, headers={'User-Agent': 'Mozilla/5.0'})
+                                with urllib.request.urlopen(req, timeout=5) as resp:
+                                    sub_data = resp.read()
+                                    
+                                # Створюємо тимчасовий файл з розширенням .ttml
+                                fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
+                                os.close(fd)
+                                with open(temp_file_path, 'wb') as tf:
+                                    tf.write(sub_data)
+                                sub_path = temp_file_path
+                                sys.stderr.write(f'[native_host] Downloaded subtitle to temp file: {sub_path}\n')
+                            except Exception as e:
+                                sys.stderr.write(f'[native_host] Failed to download subtitle: {e}\n')
+                        elif raw_sub.startswith('data:'):
+                            # Якщо це data-URI, також можна витягнути або залишити як є, але зазвичай завантаження вище покриває все
+                            pass
+
+                        cmd.append(f'--sub-file={sub_path}')
+                        sys.stderr.write(f'[native_host] sub-file argument added: {sub_path}\n')
                 proc = subprocess.Popen(cmd, shell=False)
                 pid = proc.pid
                 with _player_procs_lock:
