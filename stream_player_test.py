@@ -1,6 +1,6 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.1.1: Regex-based robust TTML/EBU-TT to SRT parser guaranteeing non-empty subtitles.
+# v2.1.2: TTML/EBU-TT to SRT parser with automatic timestamp offset normalization.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -440,54 +440,84 @@ def _start_echo_server(port: int = 8085):
     except Exception:
         pass
 
+def _parse_time_to_seconds(t_str: str) -> float:
+    parts = t_str.replace(',', '.').split(':')
+    try:
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        elif len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+    except Exception:
+        pass
+    return 0.0
+
+def _seconds_to_srt_time(sec: float) -> str:
+    if sec < 0: sec = 0
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    ms = int(round((sec - int(sec)) * 1000))
+    if ms >= 1000: ms = 999
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
 def _convert_ttml_to_srt(xml_data: bytes) -> str:
-    """Універсальний та надстійкий регулярний конвертер TTML/EBU-TT у SRT."""
+    """Конвертер TTML/EBU-TT у SRT з нормалізацією абсолютних таймінгів медіатек."""
     try:
         xml_str = xml_data.decode('utf-8', errors='ignore')
         srt_lines = []
-        index = 1
         
-        # Знаходимо всі блоки параграфів <...p ...> ... </...p> незалежно від просторів імен
         p_matches = re.findall(r'<(?:\w+:)?p\b([^>]*)>(.*?)</(?:\w+:)?p>', xml_str, re.DOTALL)
+        parsed_subs = []
+        min_begin_sec = float('inf')
         
         for attrs, content in p_matches:
-            # Витягуємо атрибути begin та end
             b_match = re.search(r'\bbegin\s*=\s*(["\'])(.*?)\1', attrs)
             e_match = re.search(r'\bend\s*=\s*(["\'])(.*?)\1', attrs)
             
             if not b_match or not e_match:
                 continue
                 
-            begin = b_match.group(2).replace('.', ',')
-            end = e_match.group(2).replace('.', ',')
+            b_sec = _parse_time_to_seconds(b_match.group(2))
+            e_sec = _parse_time_to_seconds(e_match.group(2))
             
-            if len(begin.split(':')) == 2:
-                begin = '00:' + begin
-            if len(end.split(':')) == 2:
-                end = '00:' + end
+            if b_sec < min_begin_sec:
+                min_begin_sec = b_sec
                 
-            # Замінюємо теги <br> або <...br/> на переноси рядків
             content_clean = re.sub(r'<(?:\w+:)?br\b[^>]*/?>', '\n', content)
-            # Видаляємо всі інші XML теги (наприклад span, style тощо)
             content_clean = re.sub(r'<[^>]+>', '', content_clean)
+            content_clean = (content_clean
+                             .replace('&amp;', '&')
+                             .replace('&lt;', '<')
+                             .replace('&gt;', '>')
+                             .replace('&quot;', '"')
+                             .replace('&apos;', "'"))
             
-            # Декодуємо базові HTML/XML сутності
-            content_clean = content_clean.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"').replace('&apos;', "'")
-            
-            # Очищуємо зайві пробіли на рядках
             lines = [re.sub(r'[ \t]+', ' ', l).strip() for l in content_clean.splitlines()]
             final_text = '\n'.join(filter(None, lines))
             
             if final_text:
-                srt_lines.append(str(index))
-                srt_lines.append(f"{begin} --> {end}")
-                srt_lines.append(final_text)
-                srt_lines.append("")
-                index += 1
+                parsed_subs.append((b_sec, e_sec, final_text))
                 
+        if min_begin_sec == float('inf'):
+            min_begin_sec = 0.0
+            
+        for index, (b_sec, e_sec, final_text) in enumerate(parsed_subs, 1):
+            shifted_b = b_sec - min_begin_sec
+            shifted_e = e_sec - min_begin_sec
+            if shifted_e <= shifted_b:
+                shifted_e = shifted_b + 2.0
+                
+            begin_str = _seconds_to_srt_time(shifted_b)
+            end_str = _seconds_to_srt_time(shifted_e)
+            
+            srt_lines.append(str(index))
+            srt_lines.append(f"{begin_str} --> {end_str}")
+            srt_lines.append(final_text)
+            srt_lines.append("")
+            
         return "\n".join(srt_lines)
     except Exception as e:
-        sys.stderr.write(f'[native_host] Regex TTML conversion failed: {e}\n')
+        sys.stderr.write(f'[native_host] TTML normalization failed: {e}\n')
         return ""
 
 _WORKER_COUNT = 16
@@ -554,7 +584,7 @@ def native_host_loop():
                             with open(temp_file_path, 'w', encoding='utf-8') as tf:
                                 tf.write(srt_content)
                             sub_arg = temp_file_path
-                            sys.stderr.write(f'[native_host] Successfully converted EBU-TT/TTML to SRT via regex: {sub_arg}\n')
+                            sys.stderr.write(f'[native_host] Successfully converted & normalized TTML to SRT: {sub_arg}\n')
 
                 cmd = [player, url]
                 if title and 'vlc.exe' in player.lower():
