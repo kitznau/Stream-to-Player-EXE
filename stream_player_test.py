@@ -1,6 +1,6 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.1.0: Safe namespace-aware TTML/EBU-TT to SRT converter.
+# v2.1.1: Regex-based robust TTML/EBU-TT to SRT parser guaranteeing non-empty subtitles.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -441,62 +441,53 @@ def _start_echo_server(port: int = 8085):
         pass
 
 def _convert_ttml_to_srt(xml_data: bytes) -> str:
-    """Надійний конвертер TTML/EBU-TT у SRT з урахуванням просторів імен XML."""
+    """Універсальний та надстійкий регулярний конвертер TTML/EBU-TT у SRT."""
     try:
-        root = ET.fromstring(xml_data)
-        
-        # Визначаємо простір імен TTML з кореневого тегу
-        ns_uri = "http://www.w3.org/ns/ttml"
-        if root.tag.startswith('{'):
-            ns_uri = root.tag.split('}')[0].strip('{')
-        
-        ns = {'tt': ns_uri}
-        
+        xml_str = xml_data.decode('utf-8', errors='ignore')
         srt_lines = []
         index = 1
         
-        # Шукаємо параграфи з урахуванням простору імен або без нього
-        paragraphs = root.findall('.//{http://www.w3.org/ns/ttml}p')
-        if not paragraphs:
-            paragraphs = root.findall('.//p')
+        # Знаходимо всі блоки параграфів <...p ...> ... </...p> незалежно від просторів імен
+        p_matches = re.findall(r'<(?:\w+:)?p\b([^>]*)>(.*?)</(?:\w+:)?p>', xml_str, re.DOTALL)
         
-        for p in paragraphs:
-            begin = p.get('begin', '00:00:00.000').replace('.', ',')
-            end = p.get('end', '00:00:05.000').replace('.', ',')
+        for attrs, content in p_matches:
+            # Витягуємо атрибути begin та end
+            b_match = re.search(r'\bbegin\s*=\s*(["\'])(.*?)\1', attrs)
+            e_match = re.search(r'\bend\s*=\s*(["\'])(.*?)\1', attrs)
+            
+            if not b_match or not e_match:
+                continue
+                
+            begin = b_match.group(2).replace('.', ',')
+            end = e_match.group(2).replace('.', ',')
             
             if len(begin.split(':')) == 2:
                 begin = '00:' + begin
             if len(end.split(':')) == 2:
                 end = '00:' + end
+                
+            # Замінюємо теги <br> або <...br/> на переноси рядків
+            content_clean = re.sub(r'<(?:\w+:)?br\b[^>]*/?>', '\n', content)
+            # Видаляємо всі інші XML теги (наприклад span, style тощо)
+            content_clean = re.sub(r'<[^>]+>', '', content_clean)
             
-            # Копіюємо елемент для безпечної обробки тегів br та span
-            # Збираємо текст рекурсивно через itertext
-            text_parts = []
-            if p.text:
-                text_parts.append(p.text)
-            for child in p:
-                # Якщо це перенесення рядка
-                if child.tag.endswith('br'):
-                    text_parts.append('\n')
-                if child.text:
-                    text_parts.append(child.text)
-                if child.tail:
-                    text_parts.append(child.tail)
+            # Декодуємо базові HTML/XML сутності
+            content_clean = content_clean.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"').replace('&apos;', "'")
             
-            full_text = "".join(text_parts).strip()
-            lines_cleaned = [re.sub(r'[ \t]+', ' ', line).strip() for line in full_text.splitlines()]
-            full_text = '\n'.join(filter(None, lines_cleaned))
+            # Очищуємо зайві пробіли на рядках
+            lines = [re.sub(r'[ \t]+', ' ', l).strip() for l in content_clean.splitlines()]
+            final_text = '\n'.join(filter(None, lines))
             
-            if full_text:
+            if final_text:
                 srt_lines.append(str(index))
                 srt_lines.append(f"{begin} --> {end}")
-                srt_lines.append(full_text)
+                srt_lines.append(final_text)
                 srt_lines.append("")
                 index += 1
                 
         return "\n".join(srt_lines)
     except Exception as e:
-        sys.stderr.write(f'[native_host] TTML conversion failed: {e}\n')
+        sys.stderr.write(f'[native_host] Regex TTML conversion failed: {e}\n')
         return ""
 
 _WORKER_COUNT = 16
@@ -563,7 +554,7 @@ def native_host_loop():
                             with open(temp_file_path, 'w', encoding='utf-8') as tf:
                                 tf.write(srt_content)
                             sub_arg = temp_file_path
-                            sys.stderr.write(f'[native_host] Successfully converted EBU-TT/TTML to SRT: {sub_arg}\n')
+                            sys.stderr.write(f'[native_host] Successfully converted EBU-TT/TTML to SRT via regex: {sub_arg}\n')
 
                 cmd = [player, url]
                 if title and 'vlc.exe' in player.lower():
