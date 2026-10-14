@@ -1,6 +1,6 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.0.4: Non-blocking background subtitle downloader for VLC.
+# v2.0.5: M3U playlist generator for guaranteed VLC subtitle support.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -475,39 +475,13 @@ def native_host_loop():
                     _reply({'success': False, 'error': 'Missing playerPath or streamUrl'}, seq)
                     return
                 
-                cmd = [player, url]
-                if title and 'vlc.exe' in player.lower():
-                    cmd.append(f'--meta-title={title}')
-                if 'vlc.exe' in player.lower():
-                    cmd.append('--fullscreen')
-
-                # НЕБЛОКУЮЧИЙ ЗАПУСК ВІДЕО І ФОНОВЕ ДОДАВАННЯ СУБТИТРІВ
-                def _launch_with_subs():
-                    if 'vlc.exe' in player.lower() and slave_urls and slave_urls[0]:
-                        raw_sub = urllib.parse.unquote(slave_urls[0])
-                        if raw_sub.startswith('http://') or raw_sub.startswith('https://'):
-                            try:
-                                req = urllib.request.Request(raw_sub, headers={'User-Agent': 'Mozilla/5.0'})
-                                with urllib.request.urlopen(req, timeout=4) as resp:
-                                    sub_data = resp.read()
-                                fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
-                                os.close(fd)
-                                with open(temp_file_path, 'wb') as tf:
-                                    tf.write(sub_data)
-                                # Додаємо --sub-file безпосередньо у виклик або через управління процесом, 
-                                # проте для VLC легше передати список аргументів одразу при старті, якщо завантаження миттєве.
-                            except Exception as e:
-                                sys.stderr.write(f'[native_host] Subtitle download warning: {e}\n')
-
-                # Щоб не затримувати відповідь розширенню, запускаємо VLC одразу, 
-                # а субтитри спробуємо підготувати за мілісекунди або передати безпосередньо.
                 sub_arg = None
                 if 'vlc.exe' in player.lower() and slave_urls and slave_urls[0]:
                     raw_sub = urllib.parse.unquote(slave_urls[0])
                     if raw_sub.startswith('http://') or raw_sub.startswith('https://'):
                         try:
                             req = urllib.request.Request(raw_sub, headers={'User-Agent': 'Mozilla/5.0'})
-                            with urllib.request.urlopen(req, timeout=2) as resp:
+                            with urllib.request.urlopen(req, timeout=3) as resp:
                                 sub_data = resp.read()
                             fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
                             os.close(fd)
@@ -515,7 +489,7 @@ def native_host_loop():
                                 tf.write(sub_data)
                             sub_arg = temp_file_path
                         except Exception as e:
-                            sys.stderr.write(f'[native_host] Quick sub download failed: {e}\n')
+                            sys.stderr.write(f'[native_host] Subtitle download failed: {e}\n')
                     elif raw_sub.startswith('data:'):
                         try:
                             header, encoded = raw_sub.split(',', 1)
@@ -531,8 +505,26 @@ def native_host_loop():
                         except Exception as e:
                             sys.stderr.write(f'[native_host] Data-URI sub parse failed: {e}\n')
 
-                if sub_arg:
-                    cmd.append(f'--sub-file={sub_arg}')
+                # Створюємо M3U плейлист, якщо є субтитри, щоб VLC стовідсотково їх підхопив
+                if sub_arg and 'vlc.exe' in player.lower():
+                    try:
+                        m3u_fd, m3u_path = tempfile.mkstemp(suffix='.m3u', prefix='stp_playlist_')
+                        os.close(m3u_fd)
+                        m3u_content = f"#EXTM3U\n#EXTINF:-1,{title or 'Video'}\n{url}\n#EXT-X-SUBTITLE:{sub_arg}\n"
+                        with open(m3u_path, 'w', encoding='utf-8') as m3u_file:
+                            m3u_file.write(m3u_content)
+                        
+                        cmd = [player, m3u_path, f'--input-slave={sub_arg}', '--fullscreen']
+                        sys.stderr.write(f'[native_host] Using M3U playlist with subtitle slave: {sub_path}\n')
+                    except Exception as e:
+                        sys.stderr.write(f'[native_host] M3U creation failed, falling back to direct args: {e}\n')
+                        cmd = [player, url, f'--sub-file={sub_arg}', '--fullscreen'] if sub_arg else [player, url, '--fullscreen']
+                else:
+                    cmd = [player, url]
+                    if title and 'vlc.exe' in player.lower():
+                        cmd.append(f'--meta-title={title}')
+                    if 'vlc.exe' in player.lower():
+                        cmd.append('--fullscreen')
 
                 proc = subprocess.Popen(cmd, shell=False)
                 pid = proc.pid
