@@ -728,8 +728,10 @@ def native_host_loop():
                     cmd.append('--fullscreen')
                     # Attach subtitle file when provided (first entry only; cast sends none).
                     if slave_urls and slave_urls[0]:
-                        cmd.append(f'--sub-file={slave_urls[0]}')
-                        sys.stderr.write(f'[native_host] sub-file: {slave_urls[0]}\n')
+                        # Декодуємо URL з формату %3A%2F%2F у звичайний вид https://
+                        sub_url = urllib.parse.unquote(slave_urls[0])
+                        cmd.append(f'--sub-file={sub_url}')
+                        sys.stderr.write(f'[native_host] sub-file: {sub_url}\n')
                 proc = subprocess.Popen(cmd, shell=False)
                 pid  = proc.pid
                 # Fix #3: guard dict write
