@@ -1,6 +1,6 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.1.2: TTML/EBU-TT to SRT parser with automatic timestamp offset normalization.
+# v2.1.3: Full feature-set with robust EBU-TT/TTML to SRT normalization parser.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -9,11 +9,16 @@ import xml.etree.ElementTree as ET
 import tempfile
 import base64
 
+# ── stdio fix for --noconsole ────────────────────────────────────────────────
 _devnull = open(os.devnull, 'w', encoding='utf-8')
 if sys.stderr is None: sys.stderr = _devnull
 elif hasattr(sys.stderr, 'buffer'):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 if sys.stdout is None: sys.stdout = _devnull
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 APP_NAME      = "Stream to Player"
 APP_VERSION   = "1.0"
@@ -32,6 +37,10 @@ DEFAULTS = {
     "dlna_last_discovered":  0,
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  RESOURCE PATH (frozen exe + dev mode)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _resource_path(filename: str) -> str:
     meipass = getattr(sys, '_MEIPASS', None)
     if meipass:
@@ -39,6 +48,10 @@ def _resource_path(filename: str) -> str:
         if os.path.isfile(candidate):
             return candidate
     return os.path.join(_BASE_DIR, filename)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
 
 cfg: dict = {}
 _cfg_lock = threading.RLock()
@@ -103,6 +116,10 @@ def save_config():
 def c(key):
     return cfg.get(key, DEFAULTS.get(key))
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  FIREFOX REGISTRATION
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _exe_path() -> str:
     return sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
 
@@ -125,6 +142,17 @@ def register_native_host() -> tuple:
         return True, manifest_path
     except Exception as e:
         return False, str(e)
+
+def _silent_restart():
+    try:
+        subprocess.Popen([_exe_path()], creationflags=0x00000008)
+    except Exception:
+        pass
+    os._exit(0)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DLNA
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _esc(s: str) -> str:
     return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
@@ -208,6 +236,7 @@ def discover_dlna() -> tuple:
         for loc in _ssdp_search(st, lan_ip, timeout=4.0):
             if loc not in locations:
                 locations.append(loc)
+    sys.stderr.write(f'[DLNA] SSDP found {len(locations)} location(s)\n')
     for loc in locations:
         try:
             fname, ctrl_url = _parse_dlna_desc(_fetch_desc(loc), loc)
@@ -217,9 +246,10 @@ def discover_dlna() -> tuple:
                 cfg['dlna_friendly_name'] = fname
                 if p.hostname: cfg['dlna_host'] = p.hostname
                 if p.port:     cfg['dlna_port'] = p.port
+            sys.stderr.write(f'[DLNA] DMR found: {fname} @ {ctrl_url}\n')
             return True, fname or 'Device found'
-        except Exception:
-            continue
+        except Exception as e:
+            sys.stderr.write(f'[DLNA] Skip {loc}: {e}\n')
     host, port = cfg.get('dlna_host', ''), cfg.get('dlna_port', '')
     if host and port:
         for cpath in ['/', '/desc.xml', '/description.xml', '/device.xml', '/rootDesc.xml']:
@@ -234,8 +264,12 @@ def discover_dlna() -> tuple:
                 return True, fname or 'Device found'
             except Exception:
                 continue
-    return False, 'DLNA MediaRenderer not found'
+    found_n = len(locations)
+    hint = (f' ({found_n} UPnP device(s) found but none had AVTransport)' if found_n
+            else ' (no UPnP devices found — check network/firewall)')
+    return False, f'DLNA MediaRenderer not found{hint}'
 
+_DLNA_DISCOVER_INTERVAL = 86400
 _DLNA_POLL_INTERVAL = 900
 _dlna_soap_lock = threading.Lock()
 _dlna_available = False
@@ -262,12 +296,16 @@ def _check_dlna_availability():
 
 def _start_dlna_poller():
     def _poll():
-        try: _check_dlna_availability()
-        except Exception: pass
+        try:
+            _check_dlna_availability()
+        except Exception:
+            pass
         while True:
             time.sleep(_DLNA_POLL_INTERVAL)
-            try: _check_dlna_availability()
-            except Exception: pass
+            try:
+                _check_dlna_availability()
+            except Exception:
+                pass
     threading.Thread(target=_poll, daemon=True).start()
 
 def is_dlna_available():
@@ -277,7 +315,8 @@ def is_dlna_available():
 def dlna_cast(cast_url: str, title: str) -> dict:
     ctrl = cfg.get('dlna_control_url', '')
     if not ctrl:
-        return {'success': False, 'error': "DLNA TV not found."}
+        return {'success': False, 'error': "DLNA TV not found. Use 'Find TV' in Settings."}
+
     lan_ip = cfg.get('computer_ip', '')
     if lan_ip and lan_ip not in ('127.0.0.1', 'localhost', '0.0.0.0'):
         cast_url = cast_url.replace('127.0.0.1', lan_ip).replace('localhost', lan_ip)
@@ -296,7 +335,7 @@ def dlna_cast(cast_url: str, title: str) -> dict:
         '&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" '
         'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;'
-        f'&lt;item id="0" parentID="-1" restricted="0"&gt;'
+        '&lt;item id="0" parentID="-1" restricted="0"&gt;'
         f'&lt;dc:title&gt;{_esc(title or "Video")}&lt;/dc:title&gt;'
         '&lt;upnp:class&gt;object.item.videoItem&lt;/upnp:class&gt;'
         f'&lt;res protocolInfo="{proto}"&gt;{su}&lt;/res&gt;'
@@ -304,52 +343,81 @@ def dlna_cast(cast_url: str, title: str) -> dict:
     )
     try:
         if not _dlna_soap_lock.acquire(timeout=10):
-            return {'success': False, 'error': 'DLNA busy'}
+            return {'success': False, 'error': 'DLNA busy, try again'}
         try:
             try:
-                _soap(ctrl, 'Stop', '<u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:Stop>', timeout=5)
+                _soap(ctrl, 'Stop',
+                      '<u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+                      '<InstanceID>0</InstanceID></u:Stop>', timeout=5)
             except Exception:
                 pass
-            _soap(ctrl, 'SetAVTransportURI', f'<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID><CurrentURI>{su}</CurrentURI><CurrentURIMetaData>{meta}</CurrentURIMetaData></u:SetAVTransportURI>')
-            _soap(ctrl, 'Play', '<u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID><Speed>1</Speed></u:Play>')
+            _soap(ctrl, 'SetAVTransportURI',
+                  f'<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+                  f'<InstanceID>0</InstanceID>'
+                  f'<CurrentURI>{su}</CurrentURI>'
+                  f'<CurrentURIMetaData>{meta}</CurrentURIMetaData>'
+                  f'</u:SetAVTransportURI>')
+            _soap(ctrl, 'Play',
+                  '<u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+                  '<InstanceID>0</InstanceID><Speed>1</Speed></u:Play>')
         finally:
             _dlna_soap_lock.release()
         return {'success': True}
+    except urllib.error.URLError as e:
+        return {'success': False, 'error': f'Network: {e.reason}'}
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
 def dlna_stop() -> dict:
     try:
         ctrl = cfg.get('dlna_control_url', '')
-        if not ctrl: return {'success': False, 'error': 'DLNA TV not found'}
-        if not _dlna_soap_lock.acquire(timeout=5): return {'success': False, 'error': 'DLNA busy'}
+        if not ctrl:
+            return {'success': False, 'error': 'DLNA TV not found'}
+        if not _dlna_soap_lock.acquire(timeout=5):
+            return {'success': False, 'error': 'DLNA busy'}
         try:
-            _soap(ctrl, 'Stop', '<u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:Stop>', timeout=5)
+            _soap(ctrl, 'Stop',
+                  '<u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+                  '<InstanceID>0</InstanceID></u:Stop>', timeout=5)
         finally:
             _dlna_soap_lock.release()
         return {'success': True}
+    except urllib.error.URLError as e:
+        return {'success': False, 'error': f'Network: {e.reason}'}
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
 def dlna_get_transport_state() -> dict:
     try:
         ctrl = cfg.get('dlna_control_url', '')
-        if not ctrl: return {'success': False, 'state': 'UNKNOWN'}
-        if not _dlna_soap_lock.acquire(timeout=5): return {'success': False, 'state': 'UNKNOWN'}
+        if not ctrl:
+            return {'success': False, 'error': 'DLNA TV not found', 'state': 'UNKNOWN'}
+        if not _dlna_soap_lock.acquire(timeout=5):
+            return {'success': False, 'error': 'DLNA busy', 'state': 'UNKNOWN'}
         try:
-            resp = _soap(ctrl, 'GetTransportInfo', '<u:GetTransportInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:GetTransportInfo>', timeout=5)
+            resp = _soap(ctrl, 'GetTransportInfo',
+                  '<u:GetTransportInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+                  '<InstanceID>0</InstanceID></u:GetTransportInfo>', timeout=5)
         finally:
             _dlna_soap_lock.release()
+
         match = re.search(r'<CurrentTransportState>(\w+)</CurrentTransportState>', resp.decode('utf-8'))
         state = match.group(1) if match else 'UNKNOWN'
         return {'success': True, 'state': state}
+    except urllib.error.URLError as e:
+        return {'success': False, 'error': f'Network: {e.reason}', 'state': 'UNKNOWN'}
     except Exception as e:
-        return {'success': False, 'state': 'UNKNOWN'}
+        return {'success': False, 'error': str(e), 'state': 'UNKNOWN'}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PLAYER STATE CHECK
+# ══════════════════════════════════════════════════════════════════════════════
 
 def is_player_running(player_path: str) -> bool:
     try:
         process_name = os.path.basename(player_path).replace('.exe', '').lower()
-        if not process_name: return False
+        if not process_name:
+            return False
         result = subprocess.run(
             ['wmic', 'process', 'where', f'name like "%{process_name}%"', 'get', 'name'],
             capture_output=True, text=True, timeout=5, creationflags=0x08000000,
@@ -360,85 +428,85 @@ def is_player_running(player_path: str) -> bool:
 
 def get_player_state(player_path: str) -> dict:
     try:
-        if not player_path: return {'state': 'unknown'}
+        if not player_path:
+            return {'state': 'unknown', 'error': 'Missing playerPath'}
         return {'state': 'running' if is_player_running(player_path) else 'stopped'}
     except Exception as e:
         return {'state': 'unknown', 'error': str(e)}
 
+def _auto_discover_dlna():
+    last = cfg.get('dlna_last_discovered', 0)
+    has_url = bool(cfg.get('dlna_control_url'))
+    is_reachable = False
+    if has_url:
+        is_reachable = _check_dlna_availability()
+        
+    if has_url and is_reachable:
+        if time.time() - last < _DLNA_DISCOVER_INTERVAL:
+            return
+
+    def _run():
+        try:
+            sys.stderr.write('[DLNA] Discovery started...\n')
+            ok, info = discover_dlna()
+            if ok:
+                with _cfg_lock:
+                    cfg['dlna_last_discovered'] = time.time()
+                save_config()
+                _check_dlna_availability()
+        except Exception as e:
+            sys.stderr.write(f'[DLNA] Discovery thread error: {e}\n')
+    threading.Thread(target=_run, daemon=True).start()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SLEEP BLOCK
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ES_CONTINUOUS      = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
 def _sleep_block(enable: bool):
     try:
         import ctypes
-        flag = (0x80000000 | 0x00000001) if enable else 0x80000000
+        flag = (_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED) if enable else _ES_CONTINUOUS
         ctypes.windll.kernel32.SetThreadExecutionState(flag)
     except Exception:
         pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LAZY MODULE LOADER
+# ══════════════════════════════════════════════════════════════════════════════
 
 _modules: dict = {}
 _mod_lock = threading.Lock()
 
 def _load_module(name: str):
     with _mod_lock:
-        if name in _modules: return _modules[name]
+        if name in _modules:
+            return _modules[name]
         try:
             mod = importlib.import_module(f'{name}_module')
             mod.init(cfg)
             mod.start_server()
             _modules[name] = mod
+            _rebuild_tray_menu()
             return mod
         except Exception as e:
+            msg = f'[loader] {name}_module: {e}\n{traceback.format_exc()}'
+            sys.stderr.write(msg)
+            try:
+                with open(os.path.join(_BASE_DIR, 'stp_error.log'), 'a', encoding='utf-8') as lf:
+                    lf.write(msg)
+            except Exception:
+                pass
             return None
 
-def _read_exact(f, n: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = n
-    while remaining:
-        chunk = f.read(remaining)
-        if not chunk: break
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b''.join(chunks)
+def get_module(name: str):
+    return _modules.get(name) or _load_module(name)
 
-def _get_msg(f):
-    raw = _read_exact(f, 4)
-    if len(raw) < 4: return None
-    n = struct.unpack('=I', raw)[0]
-    data = _read_exact(f, n)
-    if len(data) < n: return None
-    return json.loads(data.decode('utf-8'))
-
-def _encode_msg(msg: dict) -> bytes:
-    data = json.dumps(msg, ensure_ascii=False).encode('utf-8')
-    return struct.pack('=I', len(data)) + data
-
-_player_procs: dict = {}
-_player_procs_lock = threading.Lock()
-_hls_proxy = None
-_hls_proxy_lock = threading.Lock()
-_echo_server = None
-
-def _start_echo_server(port: int = 8085):
-    global _echo_server
-    try:
-        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-        class EchoHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == '/echo':
-                    dlna_enabled = is_dlna_available()
-                    response = {'id': 'STP Host', 'dlnaAvailable': dlna_enabled}
-                    response_json = json.dumps(response)
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(response_json)))
-                    self.end_headers()
-                    self.wfile.write(response_json.encode('utf-8'))
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-            def log_message(self, fmt, *args): pass
-        _echo_server = ThreadingHTTPServer(('127.0.0.1', port), EchoHandler)
-        threading.Thread(target=_echo_server.serve_forever, daemon=True).start()
-    except Exception:
-        pass
+# ══════════════════════════════════════════════════════════════════════════════
+#  SUBTITLE CONVERTER (TTML/EBU-TT to SRT with normalization)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_time_to_seconds(t_str: str) -> float:
     parts = t_str.replace(',', '.').split(':')
@@ -461,7 +529,6 @@ def _seconds_to_srt_time(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def _convert_ttml_to_srt(xml_data: bytes) -> str:
-    """Конвертер TTML/EBU-TT у SRT з нормалізацією абсолютних таймінгів медіатек."""
     try:
         xml_str = xml_data.decode('utf-8', errors='ignore')
         srt_lines = []
@@ -520,36 +587,107 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
         sys.stderr.write(f'[native_host] TTML normalization failed: {e}\n')
         return ""
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  NATIVE HOST  (async stdio loop)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _read_exact(f, n: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = n
+    while remaining:
+        chunk = f.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks)
+
+def _get_msg(f):
+    raw = _read_exact(f, 4)
+    if len(raw) < 4: return None
+    n    = struct.unpack('=I', raw)[0]
+    data = _read_exact(f, n)
+    if len(data) < n: return None
+    return json.loads(data.decode('utf-8'))
+
+def _encode_msg(msg: dict) -> bytes:
+    data = json.dumps(msg, ensure_ascii=False).encode('utf-8')
+    return struct.pack('=I', len(data)) + data
+
+_player_procs: dict      = {}
+_player_procs_lock       = threading.Lock()
+_hls_proxy               = None
+_hls_proxy_lock          = threading.Lock()
+_echo_server             = None
+
+def _start_echo_server(port: int = 8085):
+    global _echo_server
+    try:
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+        class EchoHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/echo':
+                    dlna_enabled = is_dlna_available()
+                    response = {
+                        'id': 'STP Host',
+                        'dlnaAvailable': dlna_enabled
+                    }
+                    response_json = json.dumps(response)
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(response_json)))
+                    self.end_headers()
+                    self.wfile.write(response_json.encode('utf-8'))
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, fmt, *args):
+                pass
+
+        _echo_server = ThreadingHTTPServer(('127.0.0.1', port), EchoHandler)
+        threading.Thread(target=_echo_server.serve_forever, daemon=True).start()
+        sys.stderr.write(f'[BG] Echo server started on port {port}\n')
+    except Exception as e:
+        sys.stderr.write(f'[BG] Echo server failed: {e}\n')
+
 _WORKER_COUNT = 16
 
 def native_host_loop():
-    fin = os.fdopen(0, 'rb', buffering=0, closefd=False)
+    fin  = os.fdopen(0, 'rb', buffering=0, closefd=False)
     fout = os.fdopen(1, 'wb', buffering=0, closefd=False)
+
     _reply_q: queue.Queue = queue.Queue()
 
     def _writer():
         while True:
             item = _reply_q.get()
-            if item is None: break
+            if item is None:
+                break
             try:
                 fout.write(item)
                 fout.flush()
-            except Exception: pass
+            except Exception as e:
+                sys.stderr.write(f'[native_host] write error: {e}\n')
 
-    threading.Thread(target=_writer, daemon=True).start()
+    writer_thread = threading.Thread(target=_writer, daemon=True)
+    writer_thread.start()
 
     def _reply(result: dict, seq):
-        if seq is not None: result = {**result, 'seq': seq}
+        if seq is not None:
+            result = {**result, 'seq': seq}
         _reply_q.put(_encode_msg(result))
 
     def _handle(msg: dict):
-        seq = msg.get('seq')
+        seq    = msg.get('seq')
         action = msg.get('action', '')
+
         try:
             if action == 'openPlayer':
                 player = msg.get('playerPath', '')
-                url = msg.get('streamUrl', '')
-                title = msg.get('title')
+                url    = msg.get('streamUrl', '')
+                title  = msg.get('title')
                 slave_urls = msg.get('slaveUrls', [])
                 if not player or not url:
                     _reply({'success': False, 'error': 'Missing playerPath or streamUrl'}, seq)
@@ -587,9 +725,9 @@ def native_host_loop():
                             sys.stderr.write(f'[native_host] Successfully converted & normalized TTML to SRT: {sub_arg}\n')
 
                 cmd = [player, url]
-                if title and 'vlc.exe' in player.lower():
-                    cmd.append(f'--meta-title={title}')
-                
+                if title:
+                    if 'vlc.exe'  in player.lower(): cmd.append(f'--meta-title={title}')
+                    elif 'mpc-hc' in player.lower(): cmd.extend(['/title', title])
                 if 'vlc.exe' in player.lower():
                     cmd.append('--fullscreen')
                     if sub_arg:
@@ -597,7 +735,7 @@ def native_host_loop():
                         sys.stderr.write(f'[native_host] Attached SRT file via --sub-file: {sub_arg}\n')
 
                 proc = subprocess.Popen(cmd, shell=False)
-                pid = proc.pid
+                pid  = proc.pid
                 with _player_procs_lock:
                     _player_procs[pid] = proc
                 def _watch_proc(p, k):
@@ -613,6 +751,7 @@ def native_host_loop():
                     proc = _player_procs.pop(pid, None) if pid else None
                 if proc and proc.poll() is None:
                     proc.terminate()
+                    sys.stderr.write(f'[native_host] stopped pid={pid}\n')
                 _reply({'success': True}, seq)
 
             elif action == 'getPlayerState':
@@ -626,12 +765,13 @@ def native_host_loop():
 
             elif action == 'dlnaCast':
                 cast_url = msg.get('castUrl', '')
-                title = msg.get('title', 'Video')
-                lan_ip = cfg.get('computer_ip', '')
+                title    = msg.get('title', 'Video')
+                lan_ip   = cfg.get('computer_ip', '')
                 if lan_ip and lan_ip not in ('127.0.0.1', 'localhost', '0.0.0.0'):
                     cast_url = cast_url.replace('127.0.0.1', lan_ip).replace('localhost', lan_ip)
                 res = dlna_cast(cast_url, title)
-                if res.get('success'): res['castUrl'] = cast_url
+                if res.get('success'):
+                    res['castUrl'] = cast_url
                 _reply(res, seq)
 
             elif action == 'dlnaStop':
@@ -657,13 +797,16 @@ def native_host_loop():
                             return
                     if not _hls_proxy.is_running():
                         if not _hls_proxy.start():
-                            _reply({'success': False, 'error': 'Proxy failed'}, seq)
+                            _reply({'success': False, 'error': 'Proxy failed to start — port 8085 busy?'}, seq)
                             return
                     _hls_proxy.new_session(url)
+                _rebuild_tray_menu()
                 _reply({'success': True, 'proxyUrl': _hls_proxy.url_for(url)}, seq)
 
             elif action == 'stopHLSProxy':
-                if _hls_proxy: _hls_proxy.stop()
+                if _hls_proxy:
+                    _hls_proxy.stop()
+                _rebuild_tray_menu()
                 _reply({'success': True}, seq)
 
             elif action == 'getProxyStats':
@@ -681,6 +824,7 @@ def native_host_loop():
 
             else:
                 _reply({'success': False, 'error': f'Unknown action: {action}'}, seq)
+
         except Exception as e:
             _reply({'success': False, 'error': str(e)}, seq)
 
@@ -688,22 +832,389 @@ def native_host_loop():
     def _worker():
         while True:
             task = _work_q.get()
-            if task is None: break
-            try: task()
-            except Exception: pass
+            if task is None:
+                break
+            try:
+                task()
+            except Exception:
+                pass
     for _ in range(_WORKER_COUNT):
         threading.Thread(target=_worker, daemon=True).start()
 
     while True:
         try:
             msg = _get_msg(fin)
-            if not msg: break
+            if not msg:
+                break
             _work_q.put(lambda m=msg: _handle(m))
-        except Exception:
+        except Exception as e:
+            sys.stderr.write(f'[native_host] reader error: {e}\n')
             break
 
-    for _ in range(_WORKER_COUNT): _work_q.put(None)
+    for _ in range(_WORKER_COUNT):
+        _work_q.put(None)
     _reply_q.put(None)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SETTINGS WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
+
+def open_settings(on_save_callback=None):
+    import tkinter as tk
+    from tkinter import messagebox
+    import glob
+
+    win = tk.Tk()
+    win.title(f"{APP_NAME} — Settings")
+    win.resizable(False, False)
+    win.attributes('-topmost', True)
+    try: win.iconbitmap(_resource_path('icon.ico'))
+    except Exception: pass
+
+    FONT   = ('Segoe UI', 10)
+    FONT_B = ('Segoe UI', 10, 'bold')
+    FONT_H = ('Segoe UI', 11, 'bold')
+    BG     = '#f5f5f5'
+    ACCENT = '#4a90e2'
+    win.configure(bg=BG)
+
+    def section(parent, text):
+        f = tk.Frame(parent, bg=BG); f.pack(fill='x', padx=12, pady=(10,2))
+        tk.Label(f, text=text, font=FONT_H, bg=BG, fg=ACCENT).pack(anchor='w')
+        tk.Frame(parent, height=1, bg=ACCENT).pack(fill='x', padx=12)
+
+    def row(parent, label, var, width=22):
+        f = tk.Frame(parent, bg=BG); f.pack(fill='x', padx=12, pady=4)
+        tk.Label(f, text=label, font=FONT, bg=BG, width=22, anchor='w').pack(side='left')
+        tk.Entry(f, textvariable=var, font=FONT, width=width, relief='solid', bd=1).pack(side='left')
+
+    def row_pair(parent, label, var1, var2, width1=22, width2=6):
+        f = tk.Frame(parent, bg=BG); f.pack(fill='x', padx=12, pady=4)
+        tk.Label(f, text=label, font=FONT, bg=BG, width=22, anchor='w').pack(side='left')
+        tk.Entry(f, textvariable=var1, font=FONT, width=width1, relief='solid', bd=1).pack(side='left')
+        tk.Entry(f, textvariable=var2, font=FONT, width=width2, relief='solid', bd=1).pack(side='left', padx=(4,0))
+
+    def row_checkbox(parent, label, bool_var, hint=''):
+        f = tk.Frame(parent, bg=BG); f.pack(fill='x', padx=12, pady=4)
+        tk.Label(f, text=label, font=FONT, bg=BG, width=22, anchor='w').pack(side='left')
+        tk.Checkbutton(f, variable=bool_var, bg=BG, activebackground=BG,
+                       relief='flat', cursor='hand2').pack(side='left')
+        if hint:
+            tk.Label(f, text=hint, font=('Segoe UI', 9), bg=BG, fg='#999').pack(side='left', padx=(4,0))
+
+    v_ip        = tk.StringVar(value=c('computer_ip'))
+    v_dlna_host = tk.StringVar(value=c('dlna_host'))
+    v_dlna_port = tk.StringVar(value=str(c('dlna_port')))
+
+    mod_vars   = []
+    _seen_keys: set = set()
+
+    def _absorb_fields(mod):
+        for field in getattr(mod, 'SETTINGS_FIELDS', []):
+            if field['key'] in _seen_keys: continue
+            _seen_keys.add(field['key'])
+            if field.get('widget') == 'checkbox':
+                true_val = field.get('true_val', 'true')
+                cur_val  = cfg.get(field['key'], field.get('default', False))
+                checked  = (cur_val == true_val) if isinstance(cur_val, str) else bool(cur_val)
+                var = tk.BooleanVar(value=checked)
+            else:
+                var = tk.StringVar(value=str(cfg.get(field['key'], field.get('default', ''))))
+            mod_vars.append({**field, 'var': var})
+
+    for mod in list(_modules.values()):
+        if mod: _absorb_fields(mod)
+    for path in sorted(glob.glob(os.path.join(_BASE_DIR, '*_module.py'))):
+        name = os.path.basename(path)[:-3]
+        try:
+            _absorb_fields(importlib.import_module(name))
+        except Exception:
+            pass
+
+    body = tk.Frame(win, bg=BG); body.pack(fill='both', expand=True, pady=(8,0))
+    section(body, "Network")
+    row(body, "Computer IP (LAN)", v_ip)
+    row_pair(body, "DLNA IP", v_dlna_host, v_dlna_port)
+    section(body, "Servers")
+    for f in mod_vars:
+        if f.get('widget') == 'checkbox':
+            row_checkbox(body, f['label'], f['var'], hint=f.get('hint',''))
+        else:
+            row(body, f['label'], f['var'], width=f.get('width', 8))
+
+    btn_frm    = tk.Frame(win, bg=BG); btn_frm.pack(fill='x', padx=12, pady=12)
+    status_var = tk.StringVar()
+    tk.Label(btn_frm, textvariable=status_var, font=('Segoe UI',9), bg=BG, fg='#666').pack(side='left')
+
+    def on_save():
+        try:
+            old_ports = tuple(cfg.get(f['key']) for f in mod_vars)
+            cfg['computer_ip'] = v_ip.get().strip()
+            cfg['dlna_host']   = v_dlna_host.get().strip()
+            dlna_port_str = v_dlna_port.get().strip()
+            cfg['dlna_port']   = int(dlna_port_str) if dlna_port_str else ''
+            for f in mod_vars:
+                if f.get('widget') == 'checkbox':
+                    cfg[f['key']] = f.get('true_val', 'true') if f['var'].get() else f.get('false_val', 'false')
+                else:
+                    cast = f.get('cast', int)
+                    cfg[f['key']] = cast(f['var'].get().strip()) if cast is str else cast(f['var'].get())
+            save_config()
+            new_ports = tuple(cfg.get(f['key']) for f in mod_vars if f.get('widget') != 'checkbox')
+            if on_save_callback: on_save_callback()
+            if old_ports != new_ports:
+                status_var.set("✓ Saved. Restarting...")
+                win.update()
+                win.after(800, lambda: (win.destroy(), _silent_restart()))
+            else:
+                win.destroy()
+        except ValueError:
+            messagebox.showerror("Error", "Ports must be integers.", parent=win)
+        except Exception:
+            messagebox.showerror("Save error", traceback.format_exc(), parent=win)
+
+    def on_detect():
+        ip = _detect_lan_ip(); v_ip.set(ip); status_var.set(f"IP detected: {ip}")
+
+    def on_find_tv():
+        status_var.set("Searching for TV...")
+        def _run():
+            try:
+                ok, info = discover_dlna()
+                if ok:
+                    with _cfg_lock:
+                        cfg['dlna_last_discovered'] = time.time()
+                    save_config()
+                status_var.set(f"✓ TV: {info}" if ok else f"✗ {info}")
+            except Exception as e:
+                status_var.set(f"✗ {e}")
+        threading.Thread(target=_run, daemon=True).start()
+
+    tk.Button(btn_frm, text="Find TV",  font=FONT,   relief='flat', bg='#e8e8e8', cursor='hand2', padx=10, command=on_find_tv).pack(side='right', padx=(4,0))
+    tk.Button(btn_frm, text="Auto IP",  font=FONT,   relief='flat', bg='#e8e8e8', cursor='hand2', padx=10, command=on_detect).pack(side='right', padx=(4,0))
+    tk.Button(btn_frm, text="Save",     font=FONT_B, relief='flat', bg=ACCENT, fg='white', cursor='hand2', padx=14, command=on_save).pack(side='right')
+
+    win.update_idletasks()
+    w, h   = win.winfo_width(), win.winfo_height()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+    win.mainloop()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TRAY
+# ══════════════════════════════════════════════════════════════════════════════
+
+_mutex_handle         = None
+_tray_icon            = None
+_brief_fn             = lambda msg, secs=5: None
+_tray_rebuild_pending = False
+_tray_rebuild_lock    = threading.Lock()
+
+def _rebuild_tray_menu():
+    global _tray_rebuild_pending
+    with _tray_rebuild_lock:
+        if _tray_rebuild_pending:
+            return
+        _tray_rebuild_pending = True
+    def _do():
+        global _tray_rebuild_pending
+        try:
+            import pystray
+            if _tray_icon is None: return
+            _tray_icon.menu = _build_menu(pystray)
+            _tray_icon.update_menu()
+        finally:
+            with _tray_rebuild_lock:
+                _tray_rebuild_pending = False
+    threading.Thread(target=_do, daemon=True).start()
+
+def _build_menu(pystray):
+    def ff_visible(item):
+        return not cfg.get('firefox_registered', False)
+
+    def _player_status(item):
+        with _player_procs_lock:
+            procs = list(_player_procs.values())
+        player_on = any(p.poll() is None for p in procs)
+        return '● Player  [playing]' if player_on else '○ Player  (idle)'
+
+    def _proxy_status(item):
+        if _hls_proxy and _hls_proxy.is_running():
+            return '● Proxy  [active]'
+        return '○ Proxy  (idle)'
+
+    mod_items = []
+    for mod in list(_modules.values()):
+        if mod and mod.is_active() and hasattr(mod, 'tray_label'):
+            def _make_lbl(m):
+                def lbl(item): return m.tray_label()
+                return lbl
+            mod_items.append(pystray.MenuItem(_make_lbl(mod), None, enabled=False))
+
+    return pystray.Menu(
+        pystray.MenuItem(f"{APP_NAME} v{APP_VERSION}", None, enabled=False, default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(_player_status, None, enabled=False),
+        pystray.MenuItem(_proxy_status,  None, enabled=False),
+        *mod_items,
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Settings...",          _on_settings_action),
+        pystray.MenuItem("Register in Firefox",  _on_register_action, visible=ff_visible),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit",                 _on_quit_action),
+    )
+
+def run_tray():
+    global _tray_icon, _brief_fn
+    import pystray
+    from PIL import Image, ImageDraw
+
+    def _load_ico(path: str):
+        try:
+            return Image.open(path).convert('RGBA')
+        except Exception as e:
+            sys.stderr.write(f'[tray] icon load failed: {e}\n')
+            raise
+
+    ICO_RUN = _load_ico(_resource_path('icon.ico'))
+
+    def _brief(msg, secs=5):
+        if _tray_icon is None: return
+        _tray_icon.title = msg
+        def _r():
+            time.sleep(secs)
+            if _tray_icon:
+                _tray_icon.title = f"{APP_NAME} v{APP_VERSION}"
+        threading.Thread(target=_r, daemon=True).start()
+
+    _brief_fn = _brief
+
+    _tray_icon = pystray.Icon(
+        name  = 'stream-to-player',
+        icon  = ICO_RUN,
+        title = f"{APP_NAME} v{APP_VERSION}",
+        menu  = _build_menu(pystray),
+    )
+    _tray_icon.run()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SINGLE INSTANCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _acquire_mutex() -> bool:
+    global _mutex_handle
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.CreateMutexW(None, True, f"Global\\{APP_NAME}")
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            return False
+        _mutex_handle = h
+        return True
+    except Exception:
+        return True
+
+def _tray_already_running() -> bool:
+    try:
+        import ctypes
+        mutex = ctypes.windll.kernel32.OpenMutexW(0x00100000, False, f"Global\\{APP_NAME}")
+        if mutex:
+            ctypes.windll.kernel32.CloseHandle(mutex)
+            return True
+        return False
+    except Exception:
+        return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TRAY ACTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _on_settings_action(icon, item):
+    threading.Thread(
+        target=lambda: open_settings(on_save_callback=lambda: _brief_fn("✓ Saved")),
+        daemon=True
+    ).start()
+
+def _on_register_action(icon, item):
+    ok, info = register_native_host()
+    if ok:
+        with _cfg_lock:
+            cfg['firefox_registered'] = True
+        save_config()
+        _brief_fn("✓ Firefox: registered successfully")
+        icon.update_menu()
+    else:
+        _brief_fn(f"✗ Error: {info[:70]}")
+
+def _kill_all_copies():
+    try:
+        if getattr(sys, 'frozen', False):
+            exe_name = os.path.basename(sys.executable)
+            subprocess.Popen(
+                ['taskkill', '/F', '/IM', exe_name],
+                creationflags=0x08000000,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            our_script = os.path.abspath(__file__)
+            try:
+                import ctypes
+                TH32CS_SNAPPROCESS = 0x00000002
+                class PROCESSENTRY32(ctypes.Structure):
+                    _fields_ = [
+                        ('dwSize',              ctypes.c_ulong),
+                        ('cntUsage',            ctypes.c_ulong),
+                        ('th32ProcessID',       ctypes.c_ulong),
+                        ('th32DefaultHeapID',   ctypes.POINTER(ctypes.c_ulong)),
+                        ('th32ModuleID',        ctypes.c_ulong),
+                        ('cntThreads',          ctypes.c_ulong),
+                        ('th32ParentProcessID', ctypes.c_ulong),
+                        ('pcPriClassBase',      ctypes.c_long),
+                        ('dwFlags',             ctypes.c_ulong),
+                        ('szExeFile',           ctypes.c_char * 260),
+                    ]
+                current_pid = os.getpid()
+                snap = ctypes.windll.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+                entry = PROCESSENTRY32(); entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                pids_to_kill = []
+                if ctypes.windll.kernel32.Process32First(snap, ctypes.byref(entry)):
+                    while True:
+                        exe = entry.szExeFile.decode('utf-8', errors='replace').lower()
+                        if 'python' in exe and entry.th32ProcessID != current_pid:
+                            pids_to_kill.append(entry.th32ProcessID)
+                        if not ctypes.windll.kernel32.Process32Next(snap, ctypes.byref(entry)):
+                            break
+                ctypes.windll.kernel32.CloseHandle(snap)
+                for pid in pids_to_kill:
+                    try:
+                        result = subprocess.run(
+                            ['wmic', 'process', 'where', f'ProcessId={pid}', 'get', 'CommandLine', '/value'],
+                            capture_output=True, text=True, timeout=2, creationflags=0x08000000,
+                        )
+                        if our_script.lower() in result.stdout.lower() or \
+                           os.path.basename(__file__).lower() in result.stdout.lower():
+                            h = ctypes.windll.kernel32.OpenProcess(1, False, pid)
+                            if h:
+                                ctypes.windll.kernel32.TerminateProcess(h, 0)
+                                ctypes.windll.kernel32.CloseHandle(h)
+                    except Exception:
+                        pass
+            except Exception:
+                import signal
+                subprocess.Popen(['pkill', '-f', os.path.basename(__file__)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    finally:
+        os._exit(0)
+
+def _on_quit_action(icon, item):
+    _sleep_block(False)
+    icon.stop()
+    _kill_all_copies()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     meipass = getattr(sys, '_MEIPASS', None)
@@ -717,16 +1228,33 @@ def main():
     def _is_pipe() -> bool:
         try:
             import ctypes
-            return ctypes.windll.kernel32.GetFileType(ctypes.windll.kernel32.GetStdHandle(-10)) == 3
+            return ctypes.windll.kernel32.GetFileType(
+                ctypes.windll.kernel32.GetStdHandle(-10)
+            ) == 3
         except Exception:
             return (sys.stdin is not None) and (not sys.stdin.isatty())
 
     is_native = _is_pipe()
+
     if is_native:
-        native_host_loop()
+        if _tray_already_running():
+            native_host_loop()
+        else:
+            if not _acquire_mutex():
+                native_host_loop()
+                return
+            register_native_host()
+            _sleep_block(True)
+            _auto_discover_dlna()
+            threading.Thread(target=native_host_loop, daemon=True).start()
+            run_tray()
     else:
+        if not _acquire_mutex():
+            return
+        register_native_host()
         _sleep_block(True)
-        native_host_loop()
+        _auto_discover_dlna()
+        run_tray()
 
 if __name__ == '__main__':
     main()
