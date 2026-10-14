@@ -1,6 +1,6 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.0.6: Direct VLC input-slave argument for reliable subtitle loading.
+# v2.0.7: TTML to SRT basic converter for guaranteed VLC subtitle compatibility.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -440,6 +440,50 @@ def _start_echo_server(port: int = 8085):
     except Exception:
         pass
 
+def _convert_ttml_to_srt(xml_data: bytes) -> str:
+    """Конвертує TTML/EBU-TT XML субтитри у звичайний формат .srt, який VLC розуміє ідеально."""
+    try:
+        root = ET.fromstring(xml_data)
+        # Знімаємо префікси простір імен для безпечного пошуку
+        for elem in root.iter():
+            if '}' in elem.tag:
+                elem.tag = elem.tag.split('}', 1)[1]
+        
+        srt_lines = []
+        index = 1
+        
+        # Шукаємо всі блоки <p> (текст субтитрів з таймінгами)
+        for p in root.iter('p'):
+            begin = p.get('begin', '00:00:00.000').replace('.', ',')
+            end = p.get('end', '00:00:05.000').replace('.', ',')
+            
+            # Форматування таймінгів для SRT (годин:хвилин:секунд,мілісекунди)
+            if len(begin.split(':')) == 2:
+                begin = '00:' + begin
+            if len(end.split(':')) == 2:
+                end = '00:' + end
+                
+            # Збираємо текст з урахуванням переносу рядків усередині тегу
+            text_parts = []
+            if p.text: text_parts.append(p.text.strip())
+            for child in p:
+                if child.tag == 'span':
+                    if child.text: text_parts.append(child.text.strip())
+                if child.tail: text_parts.append(child.tail.strip())
+            
+            sub_text = ' '.join(filter(None, text_parts))
+            if sub_text:
+                srt_lines.append(str(index))
+                srt_lines.append(f"{begin} --> {end}")
+                srt_lines.append(sub_text)
+                srt_lines.append("")
+                index += 1
+                
+        return "\n".join(srt_lines)
+    except Exception as e:
+        sys.stderr.write(f'[native_host] TTML conversion error: {e}\n')
+        return ""
+
 _WORKER_COUNT = 16
 
 def native_host_loop():
@@ -478,16 +522,12 @@ def native_host_loop():
                 sub_arg = None
                 if 'vlc.exe' in player.lower() and slave_urls and slave_urls[0]:
                     raw_sub = urllib.parse.unquote(slave_urls[0])
+                    sub_data = None
                     if raw_sub.startswith('http://') or raw_sub.startswith('https://'):
                         try:
                             req = urllib.request.Request(raw_sub, headers={'User-Agent': 'Mozilla/5.0'})
                             with urllib.request.urlopen(req, timeout=3) as resp:
                                 sub_data = resp.read()
-                            fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
-                            os.close(fd)
-                            with open(temp_file_path, 'wb') as tf:
-                                tf.write(sub_data)
-                            sub_arg = temp_file_path
                         except Exception as e:
                             sys.stderr.write(f'[native_host] Subtitle download failed: {e}\n')
                     elif raw_sub.startswith('data:'):
@@ -497,13 +537,19 @@ def native_host_loop():
                                 sub_data = base64.b64decode(encoded)
                             else:
                                 sub_data = urllib.parse.unquote(encoded).encode('utf-8')
-                            fd, temp_file_path = tempfile.mkstemp(suffix='.ttml', prefix='stp_sub_')
-                            os.close(fd)
-                            with open(temp_file_path, 'wb') as tf:
-                                tf.write(sub_data)
-                            sub_arg = temp_file_path
                         except Exception as e:
                             sys.stderr.write(f'[native_host] Data-URI sub parse failed: {e}\n')
+                    
+                    if sub_data:
+                        # Конвертуємо TTML у чистий SRT формат і зберігаємо як .srt файл
+                        srt_content = _convert_ttml_to_srt(sub_data)
+                        if srt_content:
+                            fd, temp_file_path = tempfile.mkstemp(suffix='.srt', prefix='stp_sub_')
+                            os.close(fd)
+                            with open(temp_file_path, 'w', encoding='utf-8') as tf:
+                                tf.write(srt_content)
+                            sub_arg = temp_file_path
+                            sys.stderr.write(f'[native_host] Converted and saved SRT subtitles to: {sub_arg}\n')
 
                 cmd = [player, url]
                 if title and 'vlc.exe' in player.lower():
@@ -512,10 +558,8 @@ def native_host_loop():
                 if 'vlc.exe' in player.lower():
                     cmd.append('--fullscreen')
                     if sub_arg:
-                        # Передаємо субтитри через надійні параметри VLC для підключення додаткових потоків
-                        cmd.append(f'--input-slave={sub_arg}')
                         cmd.append(f'--sub-file={sub_arg}')
-                        sys.stderr.write(f'[native_host] Attached subtitle file via input-slave/sub-file: {sub_arg}\n')
+                        sys.stderr.write(f'[native_host] Attached SRT subtitle via --sub-file: {sub_arg}\n')
 
                 proc = subprocess.Popen(cmd, shell=False)
                 pid = proc.pid
