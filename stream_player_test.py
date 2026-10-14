@@ -714,6 +714,9 @@ def native_host_loop():
                 player = msg.get('playerPath', '')
                 url    = msg.get('streamUrl', '')
                 title  = msg.get('title')
+                # slaveUrls[0] is the subtitle URL (EBU-TT/TTML XML) from mediathek-module.
+                # VLC ≥3.0 natively renders TTML/EBU-TT XML via --sub-file.
+                slave_urls = msg.get('slaveUrls', [])
                 if not player or not url:
                     _reply({'success': False, 'error': 'Missing playerPath or streamUrl'}, seq)
                     return
@@ -723,6 +726,10 @@ def native_host_loop():
                     elif 'mpc-hc' in player.lower(): cmd.extend(['/title', title])
                 if 'vlc.exe' in player.lower():
                     cmd.append('--fullscreen')
+                    # Attach subtitle file when provided (first entry only; cast sends none).
+                    if slave_urls and slave_urls[0]:
+                        cmd.append(f'--sub-file={slave_urls[0]}')
+                        sys.stderr.write(f'[native_host] sub-file: {slave_urls[0]}\n')
                 proc = subprocess.Popen(cmd, shell=False)
                 pid  = proc.pid
                 # Fix #3: guard dict write
