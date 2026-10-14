@@ -1,6 +1,6 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.0.9: Fixed TTML/EBU-TT to SRT parser with namespace stripping and br-tag handling.
+# v2.1.0: Safe namespace-aware TTML/EBU-TT to SRT converter.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -441,20 +441,26 @@ def _start_echo_server(port: int = 8085):
         pass
 
 def _convert_ttml_to_srt(xml_data: bytes) -> str:
-    """Коректний парсер EBU-TT / TTML у SRT з підтримкою тегів span та br."""
+    """Надійний конвертер TTML/EBU-TT у SRT з урахуванням просторів імен XML."""
     try:
-        xml_str = xml_data.decode('utf-8', errors='ignore')
-        # Очищуємо простори імен для спрощення пошуку тегів через ET
-        xml_str_clean = re.sub(r'xmlns(:\w+)?="[^"]+"', '', xml_str)
-        xml_str_clean = re.sub(r'<([a-zA-Z0-9]+):', '<', xml_str_clean)
-        xml_str_clean = re.sub(r'</([a-zA-Z0-9]+):', '</', xml_str_clean)
+        root = ET.fromstring(xml_data)
         
-        root = ET.fromstring(xml_str_clean.encode('utf-8'))
+        # Визначаємо простір імен TTML з кореневого тегу
+        ns_uri = "http://www.w3.org/ns/ttml"
+        if root.tag.startswith('{'):
+            ns_uri = root.tag.split('}')[0].strip('{')
+        
+        ns = {'tt': ns_uri}
         
         srt_lines = []
         index = 1
         
-        for p in root.iter('p'):
+        # Шукаємо параграфи з урахуванням простору імен або без нього
+        paragraphs = root.findall('.//{http://www.w3.org/ns/ttml}p')
+        if not paragraphs:
+            paragraphs = root.findall('.//p')
+        
+        for p in paragraphs:
             begin = p.get('begin', '00:00:00.000').replace('.', ',')
             end = p.get('end', '00:00:05.000').replace('.', ',')
             
@@ -463,12 +469,21 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
             if len(end.split(':')) == 2:
                 end = '00:' + end
             
-            # Перетворюємо теги <br> у переноси рядків перед збором тексту
-            for br in p.findall('.//br'):
-                br.tail = '\n' + (br.tail or '')
+            # Копіюємо елемент для безпечної обробки тегів br та span
+            # Збираємо текст рекурсивно через itertext
+            text_parts = []
+            if p.text:
+                text_parts.append(p.text)
+            for child in p:
+                # Якщо це перенесення рядка
+                if child.tag.endswith('br'):
+                    text_parts.append('\n')
+                if child.text:
+                    text_parts.append(child.text)
+                if child.tail:
+                    text_parts.append(child.tail)
             
-            full_text = "".join(p.itertext()).strip()
-            # Прибираємо зайві пробіли на рівнях рядків, але зберігаємо переноси
+            full_text = "".join(text_parts).strip()
             lines_cleaned = [re.sub(r'[ \t]+', ' ', line).strip() for line in full_text.splitlines()]
             full_text = '\n'.join(filter(None, lines_cleaned))
             
