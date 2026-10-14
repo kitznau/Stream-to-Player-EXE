@@ -1,6 +1,6 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.0.5: M3U playlist generator for guaranteed VLC subtitle support.
+# v2.0.6: Direct VLC input-slave argument for reliable subtitle loading.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -505,26 +505,17 @@ def native_host_loop():
                         except Exception as e:
                             sys.stderr.write(f'[native_host] Data-URI sub parse failed: {e}\n')
 
-                # Створюємо M3U плейлист, якщо є субтитри, щоб VLC стовідсотково їх підхопив
-                if sub_arg and 'vlc.exe' in player.lower():
-                    try:
-                        m3u_fd, m3u_path = tempfile.mkstemp(suffix='.m3u', prefix='stp_playlist_')
-                        os.close(m3u_fd)
-                        m3u_content = f"#EXTM3U\n#EXTINF:-1,{title or 'Video'}\n{url}\n#EXT-X-SUBTITLE:{sub_arg}\n"
-                        with open(m3u_path, 'w', encoding='utf-8') as m3u_file:
-                            m3u_file.write(m3u_content)
-                        
-                        cmd = [player, m3u_path, f'--input-slave={sub_arg}', '--fullscreen']
-                        sys.stderr.write(f'[native_host] Using M3U playlist with subtitle slave: {sub_path}\n')
-                    except Exception as e:
-                        sys.stderr.write(f'[native_host] M3U creation failed, falling back to direct args: {e}\n')
-                        cmd = [player, url, f'--sub-file={sub_arg}', '--fullscreen'] if sub_arg else [player, url, '--fullscreen']
-                else:
-                    cmd = [player, url]
-                    if title and 'vlc.exe' in player.lower():
-                        cmd.append(f'--meta-title={title}')
-                    if 'vlc.exe' in player.lower():
-                        cmd.append('--fullscreen')
+                cmd = [player, url]
+                if title and 'vlc.exe' in player.lower():
+                    cmd.append(f'--meta-title={title}')
+                
+                if 'vlc.exe' in player.lower():
+                    cmd.append('--fullscreen')
+                    if sub_arg:
+                        # Передаємо субтитри через надійні параметри VLC для підключення додаткових потоків
+                        cmd.append(f'--input-slave={sub_arg}')
+                        cmd.append(f'--sub-file={sub_arg}')
+                        sys.stderr.write(f'[native_host] Attached subtitle file via input-slave/sub-file: {sub_arg}\n')
 
                 proc = subprocess.Popen(cmd, shell=False)
                 pid = proc.pid
