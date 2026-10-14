@@ -1,6 +1,6 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
-# v2.0.7: TTML to SRT basic converter for guaranteed VLC subtitle compatibility.
+# v2.0.9: Fixed TTML/EBU-TT to SRT parser with namespace stripping and br-tag handling.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
 import socket, re, urllib.request, urllib.error, io
@@ -441,47 +441,47 @@ def _start_echo_server(port: int = 8085):
         pass
 
 def _convert_ttml_to_srt(xml_data: bytes) -> str:
-    """Конвертує TTML/EBU-TT XML субтитри у звичайний формат .srt, який VLC розуміє ідеально."""
+    """Коректний парсер EBU-TT / TTML у SRT з підтримкою тегів span та br."""
     try:
-        root = ET.fromstring(xml_data)
-        # Знімаємо префікси простір імен для безпечного пошуку
-        for elem in root.iter():
-            if '}' in elem.tag:
-                elem.tag = elem.tag.split('}', 1)[1]
+        xml_str = xml_data.decode('utf-8', errors='ignore')
+        # Очищуємо простори імен для спрощення пошуку тегів через ET
+        xml_str_clean = re.sub(r'xmlns(:\w+)?="[^"]+"', '', xml_str)
+        xml_str_clean = re.sub(r'<([a-zA-Z0-9]+):', '<', xml_str_clean)
+        xml_str_clean = re.sub(r'</([a-zA-Z0-9]+):', '</', xml_str_clean)
+        
+        root = ET.fromstring(xml_str_clean.encode('utf-8'))
         
         srt_lines = []
         index = 1
         
-        # Шукаємо всі блоки <p> (текст субтитрів з таймінгами)
         for p in root.iter('p'):
             begin = p.get('begin', '00:00:00.000').replace('.', ',')
             end = p.get('end', '00:00:05.000').replace('.', ',')
             
-            # Форматування таймінгів для SRT (годин:хвилин:секунд,мілісекунди)
             if len(begin.split(':')) == 2:
                 begin = '00:' + begin
             if len(end.split(':')) == 2:
                 end = '00:' + end
-                
-            # Збираємо текст з урахуванням переносу рядків усередині тегу
-            text_parts = []
-            if p.text: text_parts.append(p.text.strip())
-            for child in p:
-                if child.tag == 'span':
-                    if child.text: text_parts.append(child.text.strip())
-                if child.tail: text_parts.append(child.tail.strip())
             
-            sub_text = ' '.join(filter(None, text_parts))
-            if sub_text:
+            # Перетворюємо теги <br> у переноси рядків перед збором тексту
+            for br in p.findall('.//br'):
+                br.tail = '\n' + (br.tail or '')
+            
+            full_text = "".join(p.itertext()).strip()
+            # Прибираємо зайві пробіли на рівнях рядків, але зберігаємо переноси
+            lines_cleaned = [re.sub(r'[ \t]+', ' ', line).strip() for line in full_text.splitlines()]
+            full_text = '\n'.join(filter(None, lines_cleaned))
+            
+            if full_text:
                 srt_lines.append(str(index))
                 srt_lines.append(f"{begin} --> {end}")
-                srt_lines.append(sub_text)
+                srt_lines.append(full_text)
                 srt_lines.append("")
                 index += 1
                 
         return "\n".join(srt_lines)
     except Exception as e:
-        sys.stderr.write(f'[native_host] TTML conversion error: {e}\n')
+        sys.stderr.write(f'[native_host] TTML conversion failed: {e}\n')
         return ""
 
 _WORKER_COUNT = 16
@@ -541,7 +541,6 @@ def native_host_loop():
                             sys.stderr.write(f'[native_host] Data-URI sub parse failed: {e}\n')
                     
                     if sub_data:
-                        # Конвертуємо TTML у чистий SRT формат і зберігаємо як .srt файл
                         srt_content = _convert_ttml_to_srt(sub_data)
                         if srt_content:
                             fd, temp_file_path = tempfile.mkstemp(suffix='.srt', prefix='stp_sub_')
@@ -549,7 +548,7 @@ def native_host_loop():
                             with open(temp_file_path, 'w', encoding='utf-8') as tf:
                                 tf.write(srt_content)
                             sub_arg = temp_file_path
-                            sys.stderr.write(f'[native_host] Converted and saved SRT subtitles to: {sub_arg}\n')
+                            sys.stderr.write(f'[native_host] Successfully converted EBU-TT/TTML to SRT: {sub_arg}\n')
 
                 cmd = [player, url]
                 if title and 'vlc.exe' in player.lower():
@@ -559,7 +558,7 @@ def native_host_loop():
                     cmd.append('--fullscreen')
                     if sub_arg:
                         cmd.append(f'--sub-file={sub_arg}')
-                        sys.stderr.write(f'[native_host] Attached SRT subtitle via --sub-file: {sub_arg}\n')
+                        sys.stderr.write(f'[native_host] Attached SRT file via --sub-file: {sub_arg}\n')
 
                 proc = subprocess.Popen(cmd, shell=False)
                 pid = proc.pid
