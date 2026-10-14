@@ -1,5 +1,15 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
+# v2.1.5: TTML time normalization fixed. The first cue's begin is no longer
+#         subtracted blindly (shifted every cue early when the first cue was not
+#         at 0). Offset is now 36000 s only for EBU-TT timelines that start at
+#         10:00:00 (min begin >= 36000), otherwise 0 (ttp:timeBase="media").
+#         HH:MM:SS:FF frame timestamps are parsed too (25 fps).
+# v2.1.4: Subtitle temp file is now named after the TTML language code
+#         (xml:lang="de-DE" -> de.srt) so VLC shows a meaningful track name.
+#         Each launch gets its own temp dir (stp_sub_XXXX/de.srt) to avoid
+#         name collisions between parallel players; the dir is removed when
+#         the player process exits (previously stp_sub_*.srt files leaked).
 # v2.1.3: Full feature-set with robust EBU-TT/TTML to SRT normalization parser.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
@@ -8,6 +18,7 @@ from urllib.parse import urlparse, quote
 import xml.etree.ElementTree as ET
 import tempfile
 import base64
+import shutil
 
 # ── stdio fix for --noconsole ────────────────────────────────────────────────
 _devnull = open(os.devnull, 'w', encoding='utf-8')
@@ -511,6 +522,8 @@ def get_module(name: str):
 def _parse_time_to_seconds(t_str: str) -> float:
     parts = t_str.replace(',', '.').split(':')
     try:
+        if len(parts) == 4:  # HH:MM:SS:FF (frames, 25 fps)
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2]) + float(parts[3]) / 25.0
         if len(parts) == 3:
             return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
         elif len(parts) == 2:
@@ -527,6 +540,20 @@ def _seconds_to_srt_time(sec: float) -> str:
     ms = int(round((sec - int(sec)) * 1000))
     if ms >= 1000: ms = 999
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def _ttml_lang_code(xml_data: bytes) -> str:
+    """Primary language subtag from the root xml:lang ("de-DE" -> "de").
+    Falls back to "sub" when missing or not a plain alphanumeric code."""
+    try:
+        head = xml_data[:4096].decode('utf-8', errors='ignore')
+        m = re.search(r'\bxml:lang\s*=\s*["\']([^"\']+)["\']', head)
+        if m:
+            code = re.split(r'[-_]', m.group(1).strip())[0].lower()
+            if re.fullmatch(r'[a-z0-9]{2,8}', code):
+                return code
+    except Exception:
+        pass
+    return 'sub'
 
 def _convert_ttml_to_srt(xml_data: bytes) -> str:
     try:
@@ -565,12 +592,16 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
             if final_text:
                 parsed_subs.append((b_sec, e_sec, final_text))
                 
-        if min_begin_sec == float('inf'):
-            min_begin_sec = 0.0
+        # Timeline offset: EBU-TT programme timelines often start at 10:00:00.
+        # Media-relative files (min begin < 10 h) must stay untouched.
+        if min_begin_sec == float('inf') or min_begin_sec < 36000.0:
+            time_offset = 0.0
+        else:
+            time_offset = 36000.0
             
         for index, (b_sec, e_sec, final_text) in enumerate(parsed_subs, 1):
-            shifted_b = b_sec - min_begin_sec
-            shifted_e = e_sec - min_begin_sec
+            shifted_b = b_sec - time_offset
+            shifted_e = e_sec - time_offset
             if shifted_e <= shifted_b:
                 shifted_e = shifted_b + 2.0
                 
@@ -694,6 +725,7 @@ def native_host_loop():
                     return
                 
                 sub_arg = None
+                sub_dir = None
                 if 'vlc.exe' in player.lower() and slave_urls and slave_urls[0]:
                     raw_sub = urllib.parse.unquote(slave_urls[0])
                     sub_data = None
@@ -717,8 +749,8 @@ def native_host_loop():
                     if sub_data:
                         srt_content = _convert_ttml_to_srt(sub_data)
                         if srt_content:
-                            fd, temp_file_path = tempfile.mkstemp(suffix='.srt', prefix='stp_sub_')
-                            os.close(fd)
+                            sub_dir = tempfile.mkdtemp(prefix='stp_sub_')
+                            temp_file_path = os.path.join(sub_dir, _ttml_lang_code(sub_data) + '.srt')
                             with open(temp_file_path, 'w', encoding='utf-8') as tf:
                                 tf.write(srt_content)
                             sub_arg = temp_file_path
@@ -738,11 +770,13 @@ def native_host_loop():
                 pid  = proc.pid
                 with _player_procs_lock:
                     _player_procs[pid] = proc
-                def _watch_proc(p, k):
+                def _watch_proc(p, k, d):
                     p.wait()
                     with _player_procs_lock:
                         _player_procs.pop(k, None)
-                threading.Thread(target=_watch_proc, args=(proc, pid), daemon=True).start()
+                    if d:
+                        shutil.rmtree(d, ignore_errors=True)
+                threading.Thread(target=_watch_proc, args=(proc, pid, sub_dir), daemon=True).start()
                 _reply({'success': True, 'pid': pid}, seq)
 
             elif action == 'stopPlayer':
