@@ -563,66 +563,29 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
         def local_name(tag):
             return tag.split('}')[-1] if '}' in tag else tag
 
-        # 1. Збираємо стилі та витягуємо чистий колір тексту (ігноруючи прозорість фону)
-        styles = {}
-        for elem in root.iter():
-            if local_name(elem.tag) == 'style':
-                style_id = None
-                color = None
-                for k, v in elem.attrib.items():
-                    if k.endswith('id') or k == 'id':
-                        style_id = v
-                    if 'color' in k.lower():
-                        # Беремо перші 7 символів (наприклад, #ffff00), відкидаючи прозорість типу c2
-                        if v.startswith('#') and len(v) > 7:
-                            color = v[:7]
-                        else:
-                            color = v
-                if style_id and color:
-                    styles[style_id] = color
-
         srt_lines = []
         parsed_subs = []
         min_begin_sec = float('inf')
 
-        # 2. Рекурсивна функція для збору тексту
-        def parse_element(element, inherited_color=None):
+        # Рекурсивна функція для збору чистого тексту без стилів і кольорів
+        def extract_text(element):
             chunks = []
-            
-            style_ref = None
-            for k, v in element.attrib.items():
-                if k == 'style' or k.endswith(':style'):
-                    style_ref = v
-                    break
-            
-            elem_color = inherited_color
-            if style_ref and style_ref in styles:
-                elem_color = styles[style_ref]
-            
             if element.text:
-                txt = element.text
-                if elem_color:
-                    chunks.append(f'<font color="{elem_color}">{txt}</font>')
-                else:
-                    chunks.append(txt)
+                chunks.append(element.text)
             
             for child in element:
                 c_name = local_name(child.tag)
                 if c_name == 'br':
                     chunks.append('\n')
                 else:
-                    chunks.append(parse_element(child, elem_color))
+                    chunks.append(extract_text(child))
                 
                 if child.tail:
-                    tail_txt = child.tail
-                    if elem_color:
-                        chunks.append(f'<font color="{elem_color}">{tail_txt}</font>')
-                    else:
-                        chunks.append(tail_txt)
+                    chunks.append(child.tail)
                         
             return "".join(chunks)
 
-        # 3. Обробка блоків <p>
+        # Шукаємо всі блоки субтитрів (<p>)
         for elem in root.iter():
             if local_name(elem.tag) == 'p':
                 begin = elem.attrib.get('begin')
@@ -637,14 +600,23 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
                 if b_sec < min_begin_sec:
                     min_begin_sec = b_sec
                     
-                raw_text = parse_element(elem)
+                raw_text = extract_text(elem)
                 
-                lines = [l.strip() for l in raw_text.splitlines()]
+                # Очищаємо текст від зайвих пробілів та некоректних символів
+                content_clean = (raw_text
+                                 .replace('&amp;', '&')
+                                 .replace('&lt;', '<')
+                                 .replace('&gt;', '>')
+                                 .replace('&quot;', '"')
+                                 .replace('&apos;', "'"))
+                
+                lines = [l.strip() for l in content_clean.splitlines()]
                 final_text = '\n'.join(filter(None, lines))
                 
                 if final_text:
                     parsed_subs.append((b_sec, e_sec, final_text))
             
+        # Зсув таймкоду для EBU-TT (якщо хронометраж починається з 10:00:00)
         if min_begin_sec == float('inf') or min_begin_sec < 36000.0:
             time_offset = 0.0
         else:
