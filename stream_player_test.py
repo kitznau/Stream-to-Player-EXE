@@ -516,7 +516,7 @@ def get_module(name: str):
     return _modules.get(name) or _load_module(name)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SUBTITLE CONVERTER (TTML/EBU-TT to SRT with normalization)
+#  SUBTITLE CONVERTER (TTML/EBU-TT to SRT with normalization & colors)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_time_to_seconds(t_str: str) -> float:
@@ -560,6 +560,15 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
         xml_str = xml_data.decode('utf-8', errors='ignore')
         srt_lines = []
         
+        # Витягуємо стилі та їхні кольори з XML (наприклад, <tt:style xml:id="textYellow" tts:color="#ffff00"/>)
+        styles = {}
+        style_matches = re.findall(r'<(?:\w+:)?style\b([^>]+)>', xml_str)
+        for s_attrs in style_matches:
+            id_match = re.search(r'(?:xml:)?id\s*=\s*(["\'])(.*?)\1', s_attrs)
+            color_match = re.search(r'(?:tts:)?color\s*=\s*(["\'])(.*?)\1', s_attrs, re.IGNORECASE)
+            if id_match and color_match:
+                styles[id_match.group(2)] = color_match.group(2)
+        
         p_matches = re.findall(r'<(?:\w+:)?p\b([^>]*)>(.*?)</(?:\w+:)?p>', xml_str, re.DOTALL)
         parsed_subs = []
         min_begin_sec = float('inf')
@@ -577,8 +586,32 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
             if b_sec < min_begin_sec:
                 min_begin_sec = b_sec
                 
-            content_clean = re.sub(r'<(?:\w+:)?br\b[^>]*/?>', '\n', content)
-            content_clean = re.sub(r'<[^>]+>', '', content_clean)
+            # Обробка тегів всередині <p>: замінюємо <br> на перенесення рядка та обробляємо <span style="...">
+            content_processed = re.sub(r'<(?:\w+:)?br\b[^>]*/?>', '\n', content)
+            
+            def replace_span(match):
+                span_attrs = match.group(1)
+                span_text = match.group(2)
+                
+                span_text_clean = (span_text
+                                   .replace('&amp;', '&')
+                                   .replace('&lt;', '<')
+                                   .replace('&gt;', '>')
+                                   .replace('&quot;', '"')
+                                   .replace('&apos;', "'"))
+                
+                s_match = re.search(r'\bstyle\s*=\s*(["\'])(.*?)\1', span_attrs)
+                if s_match:
+                    style_name = s_match.group(2)
+                    color = styles.get(style_name)
+                    if color:
+                        return f'<font color="{color}">{span_text_clean}</font>'
+                
+                return span_text_clean
+
+            content_processed = re.sub(r'<(?:\w+:)?span\b([^>]*)>(.*?)</(?:\w+:)?span>', replace_span, content_processed, flags=re.DOTALL)
+            
+            content_clean = re.sub(r'<[^>]+>', '', content_processed)
             content_clean = (content_clean
                              .replace('&amp;', '&')
                              .replace('&lt;', '<')
