@@ -563,7 +563,7 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
         def local_name(tag):
             return tag.split('}')[-1] if '}' in tag else tag
 
-        # 1. Збираємо всі стилі та їхні кольори незалежно від префіксів просторів імен
+        # 1. Збираємо всі стилі та їхні кольори
         styles = {}
         for elem in root.iter():
             if local_name(elem.tag) == 'style':
@@ -581,22 +581,22 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
         parsed_subs = []
         min_begin_sec = float('inf')
 
-        # 2. Рекурсивна функція для збору тексту з урахуванням вкладених тегів та стилів
-        def parse_element(element, current_color=None):
+        # 2. Рекурсивна функція для збору тексту з обгортанням у <font color="...">...</font>
+        def parse_element(element, inherited_color=None):
             chunks = []
             
-            # Шукаємо стиль, прив'язаний до поточного елемента (наприклад, span або p)
+            # Шукаємо локальний стиль елемента
             style_ref = None
             for k, v in element.attrib.items():
                 if k == 'style' or k.endswith(':style'):
                     style_ref = v
                     break
             
-            elem_color = current_color
+            elem_color = inherited_color
             if style_ref and style_ref in styles:
                 elem_color = styles[style_ref]
             
-            # Додаємо власний текст елемента
+            # Якщо у нас є текст і визначено колір — загортаємо у тег font із закриттям
             if element.text:
                 txt = element.text
                 if elem_color:
@@ -604,7 +604,7 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
                 else:
                     chunks.append(txt)
             
-            # Обробляємо дочірні елементи (span, br тощо)
+            # Обробка дочірніх елементів
             for child in element:
                 c_name = local_name(child.tag)
                 if c_name == 'br':
@@ -612,7 +612,6 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
                 else:
                     chunks.append(parse_element(child, elem_color))
                 
-                # Додаємо хвіст тексту після дочірнього тегу
                 if child.tail:
                     tail_txt = child.tail
                     if elem_color:
@@ -645,7 +644,7 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
                 if final_text:
                     parsed_subs.append((b_sec, e_sec, final_text))
             
-        # Зсув таймкоду для EBU-TT (якщо хронометраж починається з 10:00:00)
+        # Зсув таймкоду для EBU-TT (10:00:00)
         if min_begin_sec == float('inf') or min_begin_sec < 36000.0:
             time_offset = 0.0
         else:
