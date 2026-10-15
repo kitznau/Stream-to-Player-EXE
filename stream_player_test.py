@@ -557,76 +557,95 @@ def _ttml_lang_code(xml_data: bytes) -> str:
 
 def _convert_ttml_to_srt(xml_data: bytes) -> str:
     try:
-        xml_str = xml_data.decode('utf-8', errors='ignore')
-        srt_lines = []
+        tree = ET.ElementTree(ET.fromstring(xml_data))
+        root = tree.getroot()
         
-        # Витягуємо стилі та їхні кольори з XML (наприклад, <tt:style xml:id="textYellow" tts:color="#ffff00"/>)
+        def local_name(tag):
+            return tag.split('}')[-1] if '}' in tag else tag
+
+        # 1. Збираємо всі стилі та їхні кольори незалежно від префіксів просторів імен
         styles = {}
-        style_matches = re.findall(r'<(?:\w+:)?style\b([^>]+)>', xml_str)
-        for s_attrs in style_matches:
-            id_match = re.search(r'(?:xml:)?id\s*=\s*(["\'])(.*?)\1', s_attrs)
-            color_match = re.search(r'(?:tts:)?color\s*=\s*(["\'])(.*?)\1', s_attrs, re.IGNORECASE)
-            if id_match and color_match:
-                styles[id_match.group(2)] = color_match.group(2)
-        
-        p_matches = re.findall(r'<(?:\w+:)?p\b([^>]*)>(.*?)</(?:\w+:)?p>', xml_str, re.DOTALL)
+        for elem in root.iter():
+            if local_name(elem.tag) == 'style':
+                style_id = None
+                color = None
+                for k, v in elem.attrib.items():
+                    if k.endswith('id') or k == 'id':
+                        style_id = v
+                    if 'color' in k.lower():
+                        color = v
+                if style_id and color:
+                    styles[style_id] = color
+
+        srt_lines = []
         parsed_subs = []
         min_begin_sec = float('inf')
-        
-        for attrs, content in p_matches:
-            b_match = re.search(r'\bbegin\s*=\s*(["\'])(.*?)\1', attrs)
-            e_match = re.search(r'\bend\s*=\s*(["\'])(.*?)\1', attrs)
-            
-            if not b_match or not e_match:
-                continue
-                
-            b_sec = _parse_time_to_seconds(b_match.group(2))
-            e_sec = _parse_time_to_seconds(e_match.group(2))
-            
-            if b_sec < min_begin_sec:
-                min_begin_sec = b_sec
-                
-            # Обробка тегів всередині <p>: замінюємо <br> на перенесення рядка та обробляємо <span style="...">
-            content_processed = re.sub(r'<(?:\w+:)?br\b[^>]*/?>', '\n', content)
-            
-            def replace_span(match):
-                span_attrs = match.group(1)
-                span_text = match.group(2)
-                
-                span_text_clean = (span_text
-                                   .replace('&amp;', '&')
-                                   .replace('&lt;', '<')
-                                   .replace('&gt;', '>')
-                                   .replace('&quot;', '"')
-                                   .replace('&apos;', "'"))
-                
-                s_match = re.search(r'\bstyle\s*=\s*(["\'])(.*?)\1', span_attrs)
-                if s_match:
-                    style_name = s_match.group(2)
-                    color = styles.get(style_name)
-                    if color:
-                        return f'<font color="{color}">{span_text_clean}</font>'
-                
-                return span_text_clean
 
-            content_processed = re.sub(r'<(?:\w+:)?span\b([^>]*)>(.*?)</(?:\w+:)?span>', replace_span, content_processed, flags=re.DOTALL)
+        # 2. Рекурсивна функція для збору тексту з урахуванням вкладених тегів та стилів
+        def parse_element(element, current_color=None):
+            chunks = []
             
-            content_clean = re.sub(r'<[^>]+>', '', content_processed)
-            content_clean = (content_clean
-                             .replace('&amp;', '&')
-                             .replace('&lt;', '<')
-                             .replace('&gt;', '>')
-                             .replace('&quot;', '"')
-                             .replace('&apos;', "'"))
+            # Шукаємо стиль, прив'язаний до поточного елемента (наприклад, span або p)
+            style_ref = None
+            for k, v in element.attrib.items():
+                if k == 'style' or k.endswith(':style'):
+                    style_ref = v
+                    break
             
-            lines = [re.sub(r'[ \t]+', ' ', l).strip() for l in content_clean.splitlines()]
-            final_text = '\n'.join(filter(None, lines))
+            elem_color = current_color
+            if style_ref and style_ref in styles:
+                elem_color = styles[style_ref]
             
-            if final_text:
-                parsed_subs.append((b_sec, e_sec, final_text))
+            # Додаємо власний текст елемента
+            if element.text:
+                txt = element.text
+                if elem_color:
+                    chunks.append(f'<font color="{elem_color}">{txt}</font>')
+                else:
+                    chunks.append(txt)
+            
+            # Обробляємо дочірні елементи (span, br тощо)
+            for child in element:
+                c_name = local_name(child.tag)
+                if c_name == 'br':
+                    chunks.append('\n')
+                else:
+                    chunks.append(parse_element(child, elem_color))
                 
-        # Timeline offset: EBU-TT programme timelines often start at 10:00:00.
-        # Media-relative files (min begin < 10 h) must stay untouched.
+                # Додаємо хвіст тексту після дочірнього тегу
+                if child.tail:
+                    tail_txt = child.tail
+                    if elem_color:
+                        chunks.append(f'<font color="{elem_color}">{tail_txt}</font>')
+                    else:
+                        chunks.append(tail_txt)
+                        
+            return "".join(chunks)
+
+        # 3. Шукаємо всі блоки субтитрів (<p>)
+        for elem in root.iter():
+            if local_name(elem.tag) == 'p':
+                begin = elem.attrib.get('begin')
+                end = elem.attrib.get('end')
+                
+                if not begin or not end:
+                    continue
+                    
+                b_sec = _parse_time_to_seconds(begin)
+                e_sec = _parse_time_to_seconds(end)
+                
+                if b_sec < min_begin_sec:
+                    min_begin_sec = b_sec
+                    
+                raw_text = parse_element(elem)
+                
+                lines = [l.strip() for l in raw_text.splitlines()]
+                final_text = '\n'.join(filter(None, lines))
+                
+                if final_text:
+                    parsed_subs.append((b_sec, e_sec, final_text))
+            
+        # Зсув таймкоду для EBU-TT (якщо хронометраж починається з 10:00:00)
         if min_begin_sec == float('inf') or min_begin_sec < 36000.0:
             time_offset = 0.0
         else:
@@ -648,7 +667,7 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
             
         return "\n".join(srt_lines)
     except Exception as e:
-        sys.stderr.write(f'[native_host] TTML normalization failed: {e}\n')
+        sys.stderr.write(f'[native_host] TTML XML parsing failed: {e}\n')
         return ""
 
 # ══════════════════════════════════════════════════════════════════════════════
