@@ -820,6 +820,67 @@ def native_host_loop():
                 else:
                     _reply({'state': 'running' if proc.poll() is None else 'stopped'}, seq)
 
+            elif action == 'downloadMkv':
+                # Remux HLS playlist → MKV via ffmpeg (stream-copy, no re-encode).
+                # ffmpeg searched in: PATH → EXE directory → common install locations.
+                # Starts ffmpeg as a non-blocking subprocess; returns { success, pid, outputPath }
+                # immediately so the browser can show a notification while ffmpeg runs.
+                playlist_url = msg.get('playlistUrl', '')
+                dl_title     = msg.get('title', 'video')
+                quality      = msg.get('quality', '')
+                if not playlist_url:
+                    _reply({'success': False, 'error': 'Missing playlistUrl'}, seq)
+                    return
+
+                # Locate ffmpeg binary
+                ffmpeg_path = shutil.which('ffmpeg')
+                if not ffmpeg_path:
+                    _exe_dir = os.path.dirname(os.path.abspath(
+                        sys.executable if getattr(sys, 'frozen', False) else __file__
+                    ))
+                    for cand in [
+                        os.path.join(_exe_dir, 'ffmpeg.exe'),
+                        r'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
+                        r'C:\ffmpeg\bin\ffmpeg.exe',
+                        r'C:\ProgramData\chocolatey\bin\ffmpeg.exe',
+                        r'C:\ProgramData\scoop\shims\ffmpeg.exe',
+                    ]:
+                        if os.path.isfile(cand):
+                            ffmpeg_path = cand
+                            break
+
+                if not ffmpeg_path:
+                    _reply({'success': False, 'error': 'ffmpeg not found — install ffmpeg and add it to PATH'}, seq)
+                    return
+
+                # Build safe output filename (strip chars forbidden in Windows paths)
+                safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', dl_title).strip('_') or 'video'
+                if quality:
+                    safe_title += f'_{quality}'
+                downloads_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+                os.makedirs(downloads_dir, exist_ok=True)
+                output_path = os.path.join(downloads_dir, f'{safe_title}.mkv')
+
+                # -c copy: stream-copy all tracks (no re-encode). -y: overwrite without prompt.
+                cmd_mkv = [ffmpeg_path, '-i', playlist_url, '-c', 'copy', '-y', output_path]
+                sys.stderr.write(f'[native_host] downloadMkv: {playlist_url} → {output_path}\n')
+
+                proc = subprocess.Popen(
+                    cmd_mkv, shell=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                pid = proc.pid
+                with _player_procs_lock:
+                    _player_procs[pid] = proc
+                def _watch_mkv(p, k):
+                    p.wait()
+                    with _player_procs_lock:
+                        _player_procs.pop(k, None)
+                    sys.stderr.write(f'[native_host] ffmpeg finished pid={k} rc={p.returncode}\n')
+                threading.Thread(target=_watch_mkv, args=(proc, pid), daemon=True).start()
+                _reply({'success': True, 'pid': pid, 'outputPath': output_path}, seq)
+
             elif action == 'dlnaCast':
                 cast_url = msg.get('castUrl', '')
                 title    = msg.get('title', 'Video')
