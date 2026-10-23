@@ -1,5 +1,9 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
+# v2.1.6: downloadMkv no longer writes an ffmpeg .log next to the output
+#         (stderr → DEVNULL). ffmpeg now receives -progress <temp file> and the
+#         new 'getMkvProgress' action returns the parsed progress (percent,
+#         out_time, speed, size, ETA) for the browser overlay to poll.
 # v2.1.5: TTML time normalization fixed. The first cue's begin is no longer
 #         subtracted blindly (shifted every cue early when the first cue was not
 #         at 0). Offset is now 36000 s only for EBU-TT timelines that start at
@@ -642,6 +646,171 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
         return ""
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FFMPEG REMUX PROGRESS  (ffmpeg -progress <file> → polled by the browser)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MKV_JOB_TTL = 600          # keep finished jobs pollable for 10 minutes
+_mkv_jobs: dict = {}        # pid -> job dict
+_mkv_jobs_lock = threading.Lock()
+
+def _read_ffmpeg_progress(path: str) -> dict:
+    """Latest key=value values from an ffmpeg -progress file.
+
+    ffmpeg appends a small block of key=value lines every ~0.5 s and flushes
+    after each block, so only the tail is read. A partial first line (when the
+    seek landed mid-line) and a partial last line (block still being written)
+    are dropped."""
+    try:
+        with open(path, 'rb') as f:
+            try:
+                f.seek(-65536, os.SEEK_END)
+                partial_head = True
+            except OSError:          # file smaller than 64 KiB
+                f.seek(0)
+                partial_head = False
+            raw = f.read()
+    except OSError:
+        return {}
+
+    complete_tail = raw.endswith(b'\n')
+    lines = raw.decode('utf-8', errors='replace').replace('\r', '\n').split('\n')
+    if partial_head and lines:
+        lines = lines[1:]
+    if not complete_tail and lines:
+        lines = lines[:-1]
+
+    data = {}
+    for line in lines:
+        if '=' not in line:
+            continue
+        key, val = line.split('=', 1)
+        key = key.strip()
+        if key:
+            data[key] = val.strip()
+    return data
+
+def _ffmpeg_out_time(prog: dict) -> float:
+    """Seconds already processed, from an ffmpeg progress dict.
+    Note: ffmpeg reports both out_time_us and out_time_ms in microseconds."""
+    for key in ('out_time_us', 'out_time_ms'):
+        val = prog.get(key)
+        if val and val != 'N/A':
+            try:
+                return max(0.0, int(val) / 1_000_000.0)
+            except (TypeError, ValueError):
+                pass
+    val = prog.get('out_time', '')
+    if val and val != 'N/A':
+        try:
+            return max(0.0, _parse_time_to_seconds(val))
+        except Exception:
+            pass
+    return 0.0
+
+def _ffmpeg_speed(prog: dict) -> float | None:
+    raw = (prog.get('speed') or '').strip().rstrip('x')
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+def _hls_duration(url: str, _depth: int = 0) -> tuple:
+    """(duration_seconds, is_live) for an HLS playlist, or (None, False).
+
+    A master playlist is followed to its first variant. Duration is only
+    reported for VOD playlists (with #EXT-X-ENDLIST); live playlists return
+    (None, True) and the overlay stays indeterminate."""
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            text = r.read(4 * 1024 * 1024).decode('utf-8', errors='replace')
+    except Exception:
+        return None, False
+
+    lines = [ln.strip() for ln in text.splitlines()]
+
+    # Master playlist → first variant stream
+    if _depth < 2 and any(ln.startswith('#EXT-X-STREAM-INF') for ln in lines):
+        for i, ln in enumerate(lines):
+            if not ln.startswith('#EXT-X-STREAM-INF'):
+                continue
+            for nxt in lines[i + 1:]:
+                if nxt and not nxt.startswith('#'):
+                    return _hls_duration(urllib.parse.urljoin(url, nxt), _depth + 1)
+            break
+        return None, False
+
+    total = 0.0
+    for ln in lines:
+        if ln.startswith('#EXTINF:'):
+            try:
+                total += float(ln.split(':', 1)[1].split(',', 1)[0].strip())
+            except (IndexError, ValueError):
+                continue
+    if total <= 0:
+        return None, False
+    return total, ('#EXT-X-ENDLIST' not in text)
+
+def _prune_mkv_jobs():
+    now = time.time()
+    with _mkv_jobs_lock:
+        stale = [pid for pid, job in _mkv_jobs.items()
+                 if job.get('finished_at') and now - job['finished_at'] > _MKV_JOB_TTL]
+        for pid in stale:
+            _mkv_jobs.pop(pid, None)
+
+def _mkv_progress_snapshot(job: dict) -> dict:
+    """JSON-safe progress snapshot for the 'getMkvProgress' action."""
+    finished = job.get('finished_at') is not None
+    rc       = job.get('returncode')
+    prog     = {} if finished else _read_ffmpeg_progress(job['progress_path'])
+
+    out_time = job.get('out_time', 0.0) if finished else _ffmpeg_out_time(prog)
+    speed_x  = None if finished else _ffmpeg_speed(prog)
+    duration = job.get('duration')
+    is_live  = bool(job.get('live'))
+
+    size = 0
+    try:
+        size = int(prog.get('total_size') or 0)
+    except (TypeError, ValueError):
+        pass
+    if finished:
+        try:
+            size = max(size, os.path.getsize(job['output_path']))
+        except OSError:
+            pass
+        state = 'finished' if rc == 0 else 'failed'
+    else:
+        state = 'running'
+
+    percent = None
+    if state == 'finished':
+        percent = 100
+    elif duration and not is_live and duration > 0:
+        percent = max(0, min(99, int(round(out_time / duration * 100))))
+
+    eta = None
+    if duration and speed_x and speed_x > 0 and not is_live and not finished:
+        eta = max(0.0, (duration - out_time) / speed_x)
+
+    return {
+        'success':    True,
+        'state':      state,
+        'pid':        job['pid'],
+        'outputPath': job['output_path'],
+        'percent':    percent,
+        'outTime':    round(out_time, 1),
+        'duration':   round(duration, 1) if duration else None,
+        'size':       size,
+        'speed':      '' if finished else (prog.get('speed') or ''),
+        'eta':        round(eta, 1) if eta is not None else None,
+        'elapsed':    round(time.time() - job['started_at'], 1),
+        'live':       is_live,
+        'error':      job.get('error'),
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  NATIVE HOST  (async stdio loop)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -824,7 +993,8 @@ def native_host_loop():
                 # Remux HLS playlist → MKV via ffmpeg (stream-copy, no re-encode).
                 # ffmpeg searched in: PATH → EXE directory → common install locations.
                 # Starts ffmpeg as a non-blocking subprocess; returns { success, pid, outputPath }
-                # immediately so the browser can show a notification while ffmpeg runs.
+                # immediately. Progress goes to a temp file via -progress and is
+                # polled from the browser through the 'getMkvProgress' action.
                 playlist_url = msg.get('playlistUrl', '')
                 dl_title     = msg.get('title', 'video')
                 quality      = msg.get('quality', '')
@@ -861,25 +1031,104 @@ def native_host_loop():
                 os.makedirs(downloads_dir, exist_ok=True)
                 output_path = os.path.join(downloads_dir, f'{safe_title}.mkv')
 
+                # ffmpeg appends progress blocks to this file; the EXE parses
+                # them on demand. Removed when ffmpeg exits.
+                fd, progress_path = tempfile.mkstemp(prefix='stp_ffmpeg_', suffix='.progress')
+                os.close(fd)
+
                 # -c copy: stream-copy all tracks (no re-encode). -y: overwrite without prompt.
-                cmd_mkv = [ffmpeg_path, '-i', playlist_url, '-c', 'copy', '-y', output_path]
+                # -progress <file>: machine-readable progress. stderr → DEVNULL (no log file).
+                cmd_mkv = [
+                    ffmpeg_path, '-hide_banner', '-loglevel', 'error', '-nostats',
+                    '-progress', progress_path,
+                    '-i', playlist_url, '-c', 'copy', '-y', output_path,
+                ]
                 sys.stderr.write(f'[native_host] downloadMkv: {playlist_url} → {output_path}\n')
 
-                proc = subprocess.Popen(
-                    cmd_mkv, shell=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                # CREATE_NO_WINDOW prevents a console window from flashing on screen.
+                _prune_mkv_jobs()
+                try:
+                    proc = subprocess.Popen(
+                        cmd_mkv, shell=False,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                except Exception:
+                    try: os.remove(progress_path)
+                    except OSError: pass
+                    raise
+
                 pid = proc.pid
+                job = {
+                    'pid':           pid,
+                    'output_path':   output_path,
+                    'progress_path': progress_path,
+                    'started_at':    time.time(),
+                    'finished_at':   None,
+                    'returncode':    None,
+                    'duration':      None,
+                    'live':          False,
+                    'out_time':      0.0,
+                    'error':         None,
+                }
+                with _mkv_jobs_lock:
+                    _mkv_jobs[pid] = job
                 with _player_procs_lock:
                     _player_procs[pid] = proc
-                def _watch_mkv(p, k):
+
+                # Duration for the progress bar (only VOD playlists have ENDLIST).
+                def _probe_duration(j, u):
+                    try:
+                        duration, is_live = _hls_duration(u)
+                        j['duration'] = duration
+                        j['live']     = is_live
+                    except Exception as e:
+                        sys.stderr.write(f'[native_host] duration probe failed: {e}\n')
+                threading.Thread(target=_probe_duration, args=(job, playlist_url), daemon=True).start()
+
+                def _watch_mkv(p, k, j):
                     p.wait()
+                    try:
+                        prog = _read_ffmpeg_progress(j['progress_path'])
+                        j['out_time'] = _ffmpeg_out_time(prog)
+                    except Exception:
+                        pass
+                    rc = p.returncode
+                    if rc is not None and rc > 0x7FFFFFFF:   # Windows: show -2, not 4294967294
+                        rc -= 0x100000000
+                    j['returncode']  = rc
+                    if rc != 0:
+                        j['error'] = f'ffmpeg exited with code {rc}'
+                    j['finished_at'] = time.time()          # set last: pollers key off it
+                    try: os.remove(j['progress_path'])
+                    except OSError: pass
                     with _player_procs_lock:
                         _player_procs.pop(k, None)
-                    sys.stderr.write(f'[native_host] ffmpeg finished pid={k} rc={p.returncode}\n')
-                threading.Thread(target=_watch_mkv, args=(proc, pid), daemon=True).start()
+                    sys.stderr.write(f'[native_host] ffmpeg finished pid={k} rc={rc}\n')
+                    _prune_mkv_jobs()
+                threading.Thread(target=_watch_mkv, args=(proc, pid, job), daemon=True).start()
                 _reply({'success': True, 'pid': pid, 'outputPath': output_path}, seq)
+
+            elif action == 'getMkvProgress':
+                # Poll ffmpeg's -progress temp file for one remux job.
+                # { pid } → { success, state, percent, outTime, duration, size,
+                #              speed, eta, elapsed, live, outputPath, error }
+                pid = msg.get('pid')
+                try:
+                    pid = int(pid) if pid is not None else None
+                except (TypeError, ValueError):
+                    pid = None
+                with _mkv_jobs_lock:
+                    if pid:
+                        job = _mkv_jobs.get(pid)
+                    else:
+                        job = max(_mkv_jobs.values(), key=lambda j: j['started_at']) if _mkv_jobs else None
+                if job is None:
+                    _reply({'success': False, 'state': 'unknown', 'error': 'Unknown download'}, seq)
+                else:
+                    _reply(_mkv_progress_snapshot(job), seq)
 
             elif action == 'dlnaCast':
                 cast_url = msg.get('castUrl', '')
