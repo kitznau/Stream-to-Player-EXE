@@ -1,5 +1,20 @@
 # EXE/stream_player_test.py
 # Stream-to-Player core module.
+# v2.1.8: HLS → MKV export is fast AND RAM-only. Segments are downloaded in
+#         parallel (10 workers) into a bounded in-RAM window and served to
+#         ffmpeg by a loopback HTTP server, so no temporary copy of the video
+#         is ever written to disk (only the final MKV). Memory is capped at
+#         roughly window × segment size because each segment is dropped as soon
+#         as ffmpeg reads it. ffmpeg's own HLS demuxer fetches segments strictly
+#         sequentially, which made remuxing much slower than the browser's
+#         parallel downloader. downloadMkv now shows a Windows Save-As dialog
+#         (phase 'selecting') and writes to "<name>.mkv.part", renamed only on
+#         success. Live/unsupported playlists still use direct ffmpeg.
+# v2.1.7: HLS → MKV remux is now fast: segments are downloaded in parallel
+#         (10 workers) into a temp dir, rewritten into a local .m3u8 and then
+#         remuxed by ffmpeg from disk. Live/unsupported playlists still use
+#         direct ffmpeg. Export was two-phase ('prefetch' → 'remuxing');
+#         'stopMkv' cancels either phase.
 # v2.1.6: downloadMkv no longer writes an ffmpeg .log next to the output
 #         (stderr → DEVNULL). ffmpeg now receives -progress <temp file> and the
 #         new 'getMkvProgress' action returns the parsed progress (percent,
@@ -17,7 +32,7 @@
 # v2.1.3: Full feature-set with robust EBU-TT/TTML to SRT normalization parser.
 
 import sys, os, json, struct, subprocess, threading, time, queue, importlib, traceback
-import socket, re, urllib.request, urllib.error, io
+import socket, re, urllib.request, urllib.error, io, http.server
 from urllib.parse import urlparse, quote
 import xml.etree.ElementTree as ET
 import tempfile
@@ -646,12 +661,73 @@ def _convert_ttml_to_srt(xml_data: bytes) -> str:
         return ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FFMPEG REMUX PROGRESS  (ffmpeg -progress <file> → polled by the browser)
+#  HLS → MKV REMUX: PARALLEL DOWNLOAD, RAM-BUFFERED
+#
+#  ffmpeg's HLS demuxer downloads segments strictly one after another, so the
+#  export was limited by network round-trips (the browser's JS downloader, with
+#  6 parallel workers, felt much faster). To remove that bottleneck the EXE now
+#  downloads segments in parallel (10 workers) into a bounded RAM buffer and
+#  hands them to ffmpeg through a loopback-only HTTP server:
+#
+#      workers ──► RAM window (N segments) ──► 127.0.0.1 ──► ffmpeg
+#
+#  Only the final MKV touches the disk, so an export no longer needs temporary
+#  space (and SSD writes) equal to the whole video. Memory stays bounded: a
+#  segment is dropped as soon as ffmpeg has read it, so usage is roughly
+#  window × segment size (tens of MB for typical streams).
+#
+#  AES-128 / fMP4 streams keep working: EXT-X-KEY / EXT-X-MAP URIs stay
+#  absolute and remote, so ffmpeg fetches the keys and decrypts the segments it
+#  reads from the local server. Live or unsupported playlists fall back to the
+#  old direct-ffmpeg path.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_MKV_JOB_TTL = 600          # keep finished jobs pollable for 10 minutes
-_mkv_jobs: dict = {}        # pid -> job dict
-_mkv_jobs_lock = threading.Lock()
+_MKV_JOB_TTL      = 600          # keep finished jobs pollable for 10 minutes
+_mkv_jobs: dict   = {}           # job_id -> job dict
+_mkv_jobs_lock    = threading.Lock()
+_mkv_job_seq      = 0
+
+_STREAM_WORKERS      = 10        # parallel segment downloads (JS downloader uses 6)
+_STREAM_WINDOW       = 10        # max segments held in RAM ahead of ffmpeg
+_STREAM_RAM_BUDGET   = 384 * 1024 * 1024   # shrink the window above this much RAM
+_STREAM_KEEP_SERVED  = 3         # recently served segments kept for re-reads
+_STREAM_MAX_SEGMENTS = 20000
+_STREAM_TIMEOUT      = 20        # per-request socket timeout, seconds
+_STREAM_RETRIES      = 3
+_STREAM_WAIT         = 150       # how long ffmpeg may wait for one segment
+
+class _StreamCancelled(Exception):
+    pass
+
+def _next_mkv_job_id() -> int:
+    global _mkv_job_seq
+    with _mkv_jobs_lock:
+        _mkv_job_seq += 1
+        return _mkv_job_seq
+
+def _as_int(val):
+    try:
+        return int(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+def _find_mkv_job(jid, pid, newest_if_none: bool = False):
+    """Job lookup by explicit jobId → ffmpeg pid → (optionally) newest job.
+
+    Older extension builds poll with no id at all, so getMkvProgress keeps the
+    'newest job' fallback; stopMkv must never cancel an arbitrary job."""
+    with _mkv_jobs_lock:
+        if jid is not None:
+            job = _mkv_jobs.get(jid)
+            if job is not None:
+                return job
+            if pid is None:
+                return None            # explicit but unknown jobId → do not guess
+        if pid is not None:
+            return next((j for j in _mkv_jobs.values() if j.get('pid') == pid), None)
+        if newest_if_none and _mkv_jobs:
+            return max(_mkv_jobs.values(), key=lambda j: j['started_at'])
+    return None
 
 def _read_ffmpeg_progress(path: str) -> dict:
     """Latest key=value values from an ffmpeg -progress file.
@@ -714,101 +790,828 @@ def _ffmpeg_speed(prog: dict) -> float | None:
     except ValueError:
         return None
 
-def _hls_duration(url: str, _depth: int = 0) -> tuple:
-    """(duration_seconds, is_live) for an HLS playlist, or (None, False).
+def _fetch_text(url: str, timeout: float = 8.0) -> str:
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(8 * 1024 * 1024).decode('utf-8', errors='replace')
 
-    A master playlist is followed to its first variant. Duration is only
-    reported for VOD playlists (with #EXT-X-ENDLIST); live playlists return
-    (None, True) and the overlay stays indeterminate."""
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            text = r.read(4 * 1024 * 1024).decode('utf-8', errors='replace')
-    except Exception:
-        return None, False
-
+def _resolve_hls_media(url: str, _depth: int = 0) -> tuple:
+    """(media_playlist_url, text) — follows a master playlist to its first variant."""
+    text = _fetch_text(url)
     lines = [ln.strip() for ln in text.splitlines()]
-
-    # Master playlist → first variant stream
     if _depth < 2 and any(ln.startswith('#EXT-X-STREAM-INF') for ln in lines):
         for i, ln in enumerate(lines):
             if not ln.startswith('#EXT-X-STREAM-INF'):
                 continue
             for nxt in lines[i + 1:]:
                 if nxt and not nxt.startswith('#'):
-                    return _hls_duration(urllib.parse.urljoin(url, nxt), _depth + 1)
+                    return _resolve_hls_media(urllib.parse.urljoin(url, nxt), _depth + 1)
             break
+    return url, text
+
+def _parse_media_playlist(text: str, base_url: str) -> dict:
+    """Segments (absolute URLs + optional byte ranges) and VOD metadata."""
+    segments = []
+    total = 0.0
+    pending_dur = 0.0
+    pending_range = None            # (offset|None, length)
+    range_ends: dict = {}
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith('#EXTINF:'):
+            try:
+                pending_dur = float(line.split(':', 1)[1].split(',', 1)[0])
+            except ValueError:
+                pending_dur = 0.0
+            continue
+        if line.startswith('#EXT-X-BYTERANGE'):
+            spec = line.split(':', 1)[1].strip() if ':' in line else ''
+            try:
+                if '@' in spec:
+                    length, off = spec.split('@', 1)
+                    pending_range = (int(off), int(length))
+                else:
+                    pending_range = (None, int(spec))
+            except ValueError:
+                pending_range = None
+            continue
+        if line.startswith('#'):
+            continue
+
+        url = urllib.parse.urljoin(base_url, line)
+        seg_range = None
+        if pending_range is not None:
+            off, length = pending_range
+            if off is None:
+                off = range_ends.get(url, 0)
+            seg_range = (off, length)
+            range_ends[url] = off + length
+        segments.append({'url': url, 'duration': pending_dur, 'range': seg_range})
+        total += pending_dur
+        pending_dur = 0.0
+        pending_range = None
+
+    return {
+        'segments': segments,
+        'duration': total,
+        'live':     '#EXT-X-ENDLIST' not in text,
+        'iframe':   '#EXT-X-I-FRAMES-ONLY' in text,
+    }
+
+def _probe_hls_duration(job: dict, url: str):
+    try:
+        media_url, text = _resolve_hls_media(url)
+        info = _parse_media_playlist(text, media_url)
+        job['duration'] = info['duration'] or None
+        job['live']     = info['live']
+    except Exception as e:
+        sys.stderr.write(f'[native_host] duration probe failed: {e}\n')
+
+def _playlist_for_server(text: str, base_url: str, names: list) -> str:
+    """Rewrite a media playlist so segments point at the local RAM server.
+
+    Segment lines become relative names served by _MemHlsServer. Keys
+    (EXT-X-KEY) and init sections (EXT-X-MAP) keep working: their URIs are made
+    absolute and stay remote — ffmpeg fetches/decrypts them as usual.
+    EXT-X-BYTERANGE tags are dropped because each buffered segment already
+    contains exactly the requested byte range."""
+    out = []
+    idx = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith('#'):
+            if line.startswith('#EXT-X-BYTERANGE'):
+                continue
+            if line.startswith(('#EXT-X-KEY:', '#EXT-X-MAP:', '#EXT-X-SESSION-KEY:')):
+                line = re.sub(
+                    r'URI="([^"]+)"',
+                    lambda m: 'URI="%s"' % urllib.parse.urljoin(base_url, m.group(1)),
+                    line,
+                )
+            out.append(line)
+            continue
+        if idx < len(names):
+            out.append(names[idx])
+        idx += 1
+    return '\n'.join(out) + '\n'
+
+def _download_hls_segment(seg: dict, f, job: dict) -> int:
+    """Stream one segment into an open binary file or BytesIO."""
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    rng = seg.get('range')
+    if rng:
+        off, length = rng
+        headers['Range'] = f'bytes={off}-{off + length - 1}'
+
+    req = urllib.request.Request(seg['url'], headers=headers)
+    written = 0
+    with urllib.request.urlopen(req, timeout=_STREAM_TIMEOUT) as r:
+        status = getattr(r, 'status', 200)
+        skip  = rng[0] if (rng and status != 206) else 0   # server ignored Range
+        limit = rng[1] if rng else None
+        while True:
+            if job['cancel'].is_set():
+                raise _StreamCancelled()
+            chunk = r.read(262144)
+            if not chunk:
+                break
+            if skip:
+                if len(chunk) <= skip:
+                    skip -= len(chunk)
+                    continue
+                chunk = chunk[skip:]
+                skip = 0
+            if limit is not None:
+                chunk = chunk[:max(0, limit - written)]
+            if chunk:
+                f.write(chunk)
+                written += len(chunk)
+                with job['stat_lock']:
+                    job['download_bytes'] = job.get('download_bytes', 0) + len(chunk)
+            if limit is not None and written >= limit:
+                break
+
+    if written == 0:
+        raise IOError('empty segment')
+    return written
+
+def _download_hls_segment_retry(seg: dict, f, job: dict) -> int:
+    last: Exception | None = None
+    for attempt in range(_STREAM_RETRIES):
+        if job['cancel'].is_set():
+            raise _StreamCancelled()
+        f.seek(0)
+        f.truncate(0)
+        try:
+            return _download_hls_segment(seg, f, job)
+        except _StreamCancelled:
+            raise
+        except Exception as e:
+            last = e
+            try:                                     # drop the partial body
+                stale = f.tell()
+                f.seek(0)
+                f.truncate(0)
+                with job['stat_lock']:
+                    job['download_bytes'] = max(0, job.get('download_bytes', 0) - stale)
+            except Exception:
+                pass
+            time.sleep(0.4 * (attempt + 1))
+    raise last if last else IOError('download failed')
+
+class _SegmentBuffer:
+    """Parallel segment downloader with a bounded in-RAM window.
+
+    Workers claim the next segment index in order and stay at most `window`
+    segments ahead of the segment ffmpeg is consuming, so memory use is
+    window × segment size instead of the whole movie. A segment is handed to
+    the HTTP handler once its download finishes, and dropped from RAM shortly
+    after ffmpeg has read it.
+    """
+
+    def __init__(self, segments: list, job: dict):
+        self.segments = segments
+        self.job      = job
+        self.error    = None          # fatal download error (string)
+        self._cond    = threading.Condition()
+        self._data: dict = {}         # index -> bytes
+        self._ready: dict = {}        # index -> threading.Event
+        self._errors: dict = {}       # index -> error string
+        self._next    = 0             # next index not yet claimed by a worker
+        self._served  = 0             # lowest index ffmpeg has not consumed
+        self._avg     = 0.0           # running average segment size, bytes
+        self._closed  = False
+        self._threads: list = []
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    @property
+    def count(self) -> int:
+        return len(self.segments)
+
+    def _window(self) -> int:
+        if self._avg <= 0:
+            return _STREAM_WINDOW
+        by_bytes = int(_STREAM_RAM_BUDGET // self._avg)
+        return max(2, min(_STREAM_WINDOW, by_bytes))
+
+    def _event(self, idx: int) -> threading.Event:
+        ev = self._ready.get(idx)
+        if ev is None:
+            ev = self._ready[idx] = threading.Event()
+        return ev
+
+    def _abort(self, message: str):
+        with self._cond:
+            if self.error is None:
+                self.error = message
+            self._closed = True
+            self._cond.notify_all()
+        with self.job['stat_lock']:
+            if not self.job.get('stream_error'):
+                self.job['stream_error'] = message
+
+    # ── worker pool ───────────────────────────────────────────────────────────
+    def start(self):
+        for _ in range(max(1, min(_STREAM_WORKERS, self.count))):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def close(self):
+        with self._cond:
+            if self.error is None:
+                self.error = 'stopped'
+            self._closed = True
+            self._cond.notify_all()
+
+    def _claim(self):
+        with self._cond:
+            while True:
+                if self._closed or self.job['cancel'].is_set():
+                    return None
+                if self._next >= self.count:
+                    return None
+                if self._next < self._served + self._window():
+                    idx = self._next
+                    self._next += 1
+                    return idx
+                self._cond.wait(0.2)
+
+    def _worker(self):
+        while True:
+            idx = self._claim()
+            if idx is None:
+                return
+            ev = self._event(idx)
+            buf = io.BytesIO()
+            try:
+                _download_hls_segment_retry(self.segments[idx], buf, self.job)
+            except _StreamCancelled:
+                with self._cond:
+                    self._errors.setdefault(idx, 'cancelled')
+                self._abort('cancelled')
+                ev.set()
+                return
+            except Exception as e:
+                msg = str(e) or 'download failed'
+                with self._cond:
+                    self._errors.setdefault(idx, msg)
+                self._abort(msg)
+                ev.set()
+                return
+
+            data = buf.getvalue()
+            stored = False
+            with self._cond:
+                if not self._closed:
+                    self._data[idx] = data
+                    self._avg = len(data) if self._avg <= 0 else (self._avg * 0.8 + len(data) * 0.2)
+                    stored = True
+            ev.set()
+            if stored:
+                with self.job['stat_lock']:
+                    self.job['buffered_bytes'] = self.job.get('buffered_bytes', 0) + len(data)
+            with self.job['stat_lock']:
+                self.job['segments_done'] = self.job.get('segments_done', 0) + 1
+
+    # ── consumer side (HTTP handler) ──────────────────────────────────────────
+    def get(self, idx: int, timeout: float = _STREAM_WAIT) -> bytes:
+        """Bytes for segment `idx`, waiting for the download if necessary."""
+        with self._cond:
+            data = self._data.get(idx)
+            if data is not None:
+                return data
+            already_passed = idx < self._next and idx < self._served
+        if already_passed:
+            # ffmpeg re-opened a segment that was already dropped from RAM.
+            buf = io.BytesIO()
+            _download_hls_segment_retry(self.segments[idx], buf, self.job)
+            return buf.getvalue()
+
+        ev = self._event(idx)
+        deadline = time.time() + timeout
+        while True:
+            with self._cond:
+                data = self._data.get(idx)
+                if data is not None:
+                    return data
+                err = self._errors.get(idx) or self.error
+                if err:
+                    raise IOError(err)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise IOError('timed out waiting for segment')
+            ev.wait(min(0.5, remaining))
+
+    def mark_served(self, idx: int):
+        """ffmpeg finished reading segment `idx`: free RAM it no longer needs."""
+        with self._cond:
+            if idx + 1 > self._served:
+                self._served = idx + 1
+            keep_from = self._served - _STREAM_KEEP_SERVED
+            freed = 0
+            for k in [k for k in self._data if k < keep_from]:
+                freed += len(self._data.pop(k))
+                self._ready.pop(k, None)
+            if freed:
+                with self.job['stat_lock']:
+                    self.job['buffered_bytes'] = max(
+                        0, self.job.get('buffered_bytes', 0) - freed)
+            self._cond.notify_all()
+
+class _MemHlsHandler(http.server.BaseHTTPRequestHandler):
+    """Serves the rewritten playlist and buffered segments on 127.0.0.1."""
+
+    protocol_version = 'HTTP/1.0'
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _is_mp4(self, name: str) -> bool:
+        return name.lower().endswith(('.m4s', '.mp4', '.m4a'))
+
+    def _send(self, code: int, body: bytes, ctype: str, head_only: bool = False):
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def do_GET(self, head_only: bool = False):
+        srv = self.server
+        path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path).lstrip('/')
+        if path == srv.playlist_path:
+            self._send(200, srv.playlist_bytes, 'application/vnd.apple.mpegurl', head_only)
+            return
+        idx = srv.names.get(path)
+        if idx is None:
+            self._send(404, b'not found', 'text/plain', head_only)
+            return
+        try:
+            data = srv.store.get(idx)
+        except Exception as e:
+            sys.stderr.write(f'[native_host] segment {idx} unavailable: {e}\n')
+            self._send(502, str(e).encode('utf-8', 'replace'), 'text/plain', head_only)
+            return
+        ctype = 'video/mp4' if self._is_mp4(path) else 'video/mp2t'
+        try:
+            self._send(200, data, ctype, head_only)
+        finally:
+            if not head_only:
+                srv.store.mark_served(idx)
+
+    def do_HEAD(self):
+        self.do_GET(head_only=True)
+
+class _MemHlsServer:
+    """Loopback HTTP server exposing the RAM buffer to ffmpeg.
+
+    ffmpeg's HLS demuxer only reads URLs/files, so the buffered segments are
+    published as http://127.0.0.1:<random port>/<random token>/… . The socket
+    is bound to loopback only and both the port and the path token are random,
+    so other local processes cannot easily grab the stream."""
+
+    def __init__(self, playlist_text: str, names: list, store: _SegmentBuffer, token: str):
+        self.playlist_bytes = playlist_text.encode('utf-8')
+        self.names = {name: i for i, name in enumerate(names)}
+        self.playlist_path = f'{token}/playlist.m3u8'
+        self.store = store
+        self.url   = None
+        self._httpd = None
+
+    def start(self) -> str:
+        class _Server(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+            def handle_error(self, request, client_address):
+                # ffmpeg closes the socket when it is terminated (cancel) or
+                # stops reading early — not worth a traceback in the log.
+                exc = sys.exc_info()[1]
+                if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+                    return
+                super().handle_error(request, client_address)
+
+        self._httpd = _Server(('127.0.0.1', 0), _MemHlsHandler)
+        self._httpd.playlist_bytes = self.playlist_bytes
+        self._httpd.playlist_path = self.playlist_path
+        self._httpd.names = self.names
+        self._httpd.store = self.store
+        port = self._httpd.server_address[1]
+        threading.Thread(
+            target=self._httpd.serve_forever,
+            kwargs={'poll_interval': 0.2},
+            daemon=True,
+        ).start()
+        self.url = f'http://127.0.0.1:{port}/{self.playlist_path}'
+        return self.url
+
+    def stop(self):
+        httpd, self._httpd = self._httpd, None
+        if httpd is None:
+            return
+
+        def _shutdown():
+            try: httpd.shutdown()
+            except Exception: pass
+            try: httpd.server_close()
+            except Exception: pass
+
+        # Bounded wait: shutdown() blocks until serve_forever() returns.
+        t = threading.Thread(target=_shutdown, daemon=True)
+        t.start()
+        t.join(3.0)
+
+def _start_streaming_input(playlist_url: str, job: dict):
+    """Build a RAM-buffered input for ffmpeg.
+
+    Returns (server, store) or (None, None) when this playlist cannot be
+    streamed that way (live, I-frame-only, non-http segments, too long)."""
+    media_url, text = _resolve_hls_media(playlist_url)
+    info = _parse_media_playlist(text, media_url)
+    segs = info['segments']
+    job['duration'] = info['duration'] or None
+    job['live']     = info['live']
+
+    if (info['live'] or info['iframe'] or not segs
+            or len(segs) > _STREAM_MAX_SEGMENTS
+            or not all(s['url'].lower().startswith(('http://', 'https://')) for s in segs)):
+        return None, None
+
+    local_names = []
+    token = os.urandom(8).hex()
+    for i, seg in enumerate(segs):
+        ext = os.path.splitext(urllib.parse.urlparse(seg['url']).path)[1].lower()
+        if ext not in ('.ts', '.m4s', '.mp4', '.m4a', '.aac', '.mp3', '.ac3', '.ec3'):
+            ext = '.ts'
+        local_names.append(f'seg_{i:05d}{ext}')
+
+    playlist_text = _playlist_for_server(text, media_url, local_names)
+    with job['stat_lock']:
+        job['segments_total'] = len(segs)
+        job['segments_done']  = 0
+
+    store  = _SegmentBuffer(segs, job)
+    # The playlist is served from /<token>/, so segment URLs resolve relative
+    # to it; the handler therefore sees "<token>/seg_NNNNN.ts".
+    server = _MemHlsServer(playlist_text,
+                           [f'{token}/{name}' for name in local_names],
+                           store, token)
+    url = server.start()
+    store.start()
+    job['store']  = store
+    job['server'] = server
+    sys.stderr.write(f'[native_host] streaming {len(segs)} segments via {url}\n')
+    return server, store
+
+def _normalize_output_path(path: str) -> str:
+    path = os.path.abspath(os.path.expanduser((path or '').strip().strip('"')))
+    if not os.path.splitext(path)[1]:
+        path += '.mkv'
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
+
+def _ask_save_path(suggested_path: str, title: str = 'Save video as') -> tuple:
+    """Windows Save-As dialog (comdlg32.GetSaveFileNameW).
+
+    Returns (chosen_path | None, cancelled). A user cancel is not an error:
+    the export is simply dropped before any bandwidth is spent. On dialog
+    failure (or a non-Windows host) it returns (None, False) and the caller
+    falls back to the suggested path.
+    """
+    if os.name != 'nt':
+        return None, False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
         return None, False
 
-    total = 0.0
-    for ln in lines:
-        if ln.startswith('#EXTINF:'):
-            try:
-                total += float(ln.split(':', 1)[1].split(',', 1)[0].strip())
-            except (IndexError, ValueError):
-                continue
-    if total <= 0:
+    class OPENFILENAMEW(ctypes.Structure):
+        _fields_ = [
+            ('lStructSize',       wintypes.DWORD),
+            ('hwndOwner',         wintypes.HWND),
+            ('hInstance',         wintypes.HINSTANCE),
+            ('lpstrFilter',       wintypes.LPCWSTR),
+            ('lpstrCustomFilter', wintypes.LPWSTR),
+            ('nMaxCustFilter',    wintypes.DWORD),
+            ('nFilterIndex',      wintypes.DWORD),
+            ('lpstrFile',         wintypes.LPWSTR),
+            ('nMaxFile',          wintypes.DWORD),
+            ('lpstrFileTitle',    wintypes.LPWSTR),
+            ('nMaxFileTitle',     wintypes.DWORD),
+            ('lpstrInitialDir',   wintypes.LPCWSTR),
+            ('lpstrTitle',        wintypes.LPCWSTR),
+            ('Flags',             wintypes.DWORD),
+            ('nFileOffset',       wintypes.WORD),
+            ('nFileExtension',    wintypes.WORD),
+            ('lpstrDefExt',       wintypes.LPCWSTR),
+            ('lCustData',         wintypes.LPARAM),
+            ('lpfnHook',          ctypes.c_void_p),
+            ('lpTemplateName',    wintypes.LPCWSTR),
+            ('pvReserved',        ctypes.c_void_p),
+            ('dwReserved',        wintypes.DWORD),
+            ('FlagsEx',           wintypes.DWORD),
+        ]
+
+    OFN_OVERWRITEPROMPT = 0x00000002
+    OFN_HIDEREADONLY    = 0x00000004
+    OFN_NOCHANGEDIR     = 0x00000008
+    OFN_PATHMUSTEXIST   = 0x00000800
+    OFN_EXPLORER        = 0x00080000
+
+    file_buf = ctypes.create_unicode_buffer(suggested_path, 32768)
+    filter_buf = ctypes.create_unicode_buffer(
+        'Matroska video (*.mkv)\0*.mkv\0All files (*.*)\0*.*\0\0'
+    )
+
+    ofn = OPENFILENAMEW()
+    ofn.lStructSize  = ctypes.sizeof(OPENFILENAMEW)
+    try:
+        ofn.hwndOwner = ctypes.windll.user32.GetForegroundWindow()
+    except Exception:
+        pass
+    ofn.lpstrFilter  = ctypes.cast(filter_buf, wintypes.LPCWSTR)
+    ofn.nFilterIndex = 1
+    ofn.lpstrFile    = ctypes.cast(file_buf, wintypes.LPWSTR)
+    ofn.nMaxFile     = len(file_buf)
+    ofn.lpstrTitle   = title
+    ofn.lpstrDefExt  = 'mkv'
+    ofn.Flags        = (OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST
+                        | OFN_NOCHANGEDIR | OFN_HIDEREADONLY)
+
+    ole32 = ctypes.windll.ole32
+    try:
+        com = ole32.CoInitializeEx(None, 0x2)      # STA, needed by the dialog
+    except Exception:
+        com = None
+    try:
+        comdlg32 = ctypes.windll.comdlg32
+        comdlg32.GetSaveFileNameW.argtypes = [ctypes.POINTER(OPENFILENAMEW)]
+        comdlg32.GetSaveFileNameW.restype  = wintypes.BOOL
+        if comdlg32.GetSaveFileNameW(ctypes.byref(ofn)):
+            path = file_buf.value.strip()
+            return (path or None), False
+        err = comdlg32.CommDlgExtendedError()
+        if err:
+            sys.stderr.write(f'[native_host] save dialog failed: 0x{err:04X}\n')
+            return None, False
+        return None, True                          # user pressed Cancel
+    except Exception as e:
+        sys.stderr.write(f'[native_host] save dialog error: {e}\n')
         return None, False
-    return total, ('#EXT-X-ENDLIST' not in text)
+    finally:
+        if com == 0:
+            try: ole32.CoUninitialize()
+            except Exception: pass
 
 def _prune_mkv_jobs():
     now = time.time()
     with _mkv_jobs_lock:
-        stale = [pid for pid, job in _mkv_jobs.items()
+        stale = [jid for jid, job in _mkv_jobs.items()
                  if job.get('finished_at') and now - job['finished_at'] > _MKV_JOB_TTL]
-        for pid in stale:
-            _mkv_jobs.pop(pid, None)
+        for jid in stale:
+            _mkv_jobs.pop(jid, None)
 
 def _mkv_progress_snapshot(job: dict) -> dict:
     """JSON-safe progress snapshot for the 'getMkvProgress' action."""
     finished = job.get('finished_at') is not None
     rc       = job.get('returncode')
-    prog     = {} if finished else _read_ffmpeg_progress(job['progress_path'])
-
-    out_time = job.get('out_time', 0.0) if finished else _ffmpeg_out_time(prog)
-    speed_x  = None if finished else _ffmpeg_speed(prog)
+    phase    = job.get('phase', 'remuxing')
     duration = job.get('duration')
     is_live  = bool(job.get('live'))
+    elapsed  = max(0.0, time.time() - job['started_at'])
+    output   = job.get('output_path')
 
-    size = 0
-    try:
-        size = int(prog.get('total_size') or 0)
-    except (TypeError, ValueError):
-        pass
+    out_time = 0.0
+    size     = 0
+    speed    = ''
+    eta      = None
+    percent  = None
+    segments_done  = job.get('segments_done', 0)
+    segments_total = job.get('segments_total', 0)
+
     if finished:
-        try:
-            size = max(size, os.path.getsize(job['output_path']))
-        except OSError:
-            pass
         state = 'finished' if rc == 0 else 'failed'
-    else:
+        phase = 'done'
+        out_time = job.get('out_time', 0.0)
+        try:
+            size = os.path.getsize(output)
+        except (OSError, TypeError):
+            size = job.get('download_bytes', 0)
+        percent = 100 if state == 'finished' else None
+
+    elif phase in ('selecting', 'preparing'):
+        # Waiting for the Save-As dialog: nothing is downloaded yet.
         state = 'running'
 
-    percent = None
-    if state == 'finished':
-        percent = 100
-    elif duration and not is_live and duration > 0:
-        percent = max(0, min(99, int(round(out_time / duration * 100))))
+    else:
+        state = 'running'
+        prog  = _read_ffmpeg_progress(job['progress_path'])
+        out_time = _ffmpeg_out_time(prog)
+        speed_x  = _ffmpeg_speed(prog)
+        try:
+            size = int(prog.get('total_size') or 0)
+        except (TypeError, ValueError):
+            size = 0
+        speed = prog.get('speed') or ''
 
-    eta = None
-    if duration and speed_x and speed_x > 0 and not is_live and not finished:
-        eta = max(0.0, (duration - out_time) / speed_x)
+        if duration and not is_live and duration > 0:
+            ratio = max(0.0, min(1.0, out_time / duration))
+            percent = max(0, min(99, int(round(ratio * 100))))
+            if speed_x and speed_x > 0:
+                eta = max(0.0, (duration - out_time) / speed_x)
 
     return {
-        'success':    True,
-        'state':      state,
-        'pid':        job['pid'],
-        'outputPath': job['output_path'],
-        'percent':    percent,
-        'outTime':    round(out_time, 1),
-        'duration':   round(duration, 1) if duration else None,
-        'size':       size,
-        'speed':      '' if finished else (prog.get('speed') or ''),
-        'eta':        round(eta, 1) if eta is not None else None,
-        'elapsed':    round(time.time() - job['started_at'], 1),
-        'live':       is_live,
-        'error':      job.get('error'),
+        'success':       True,
+        'state':         state,
+        'phase':         phase,
+        'jobId':         job['job_id'],
+        'pid':           job.get('pid'),
+        'outputPath':    output,
+        'percent':       percent,
+        'outTime':       round(out_time, 1),
+        'duration':      round(duration, 1) if duration else None,
+        'size':          size,
+        'speed':         speed,
+        'eta':           round(eta, 1) if eta is not None else None,
+        'elapsed':       round(elapsed, 1),
+        'live':          is_live,
+        'segmentsDone':  segments_done,
+        'segmentsTotal': segments_total,
+        'bufferedBytes': job.get('buffered_bytes', 0),
+        'downloadedBytes': job.get('download_bytes', 0),
+        'error':         job.get('error'),
     }
+
+def _stop_job_stream(job: dict):
+    """Stop the segment workers and the loopback HTTP server of a job."""
+    store = job.pop('store', None)
+    if store is not None:
+        try: store.close()
+        except Exception: pass
+    server = job.pop('server', None)
+    if server is not None:
+        try: server.stop()
+        except Exception: pass
+
+def _remove_part(job: dict):
+    """Delete an unfinished .part output (never the user's chosen file)."""
+    part = job.pop('part_path', None)
+    if part:
+        try: os.remove(part)
+        except OSError: pass
+
+def _finish_mkv_job(job: dict, rc: int, error: str | None = None):
+    """Finalize a job that never reached (or never completed) ffmpeg."""
+    _stop_job_stream(job)
+    job['returncode'] = rc
+    if error and not job.get('error'):
+        job['error'] = error
+    if rc == 0:
+        job['error'] = None
+    else:
+        _remove_part(job)
+    job['phase'] = 'done'
+    job['finished_at'] = time.time()
+    try: os.remove(job['progress_path'])
+    except OSError: pass
+    _prune_mkv_jobs()
+
+def _watch_mkv(p, job: dict):
+    p.wait()
+    stream_error = job.get('stream_error')
+    _stop_job_stream(job)
+    try:
+        prog = _read_ffmpeg_progress(job['progress_path'])
+        job['out_time'] = _ffmpeg_out_time(prog)
+    except Exception:
+        pass
+
+    rc = p.returncode
+    if rc is not None and rc > 0x7FFFFFFF:   # Windows: show -2, not 4294967294
+        rc -= 0x100000000
+
+    if rc == 0:
+        # ffmpeg wrote <name>.mkv.part so a failed/cancelled export never
+        # leaves a half-written file under the user's chosen name.
+        part = job.pop('part_path', None)
+        out  = job.get('output_path')
+        if part and out:
+            try:
+                os.replace(part, out)
+            except OSError as e:
+                rc = -1
+                job['error'] = f'cannot save file: {e}'
+    if rc != 0:
+        _remove_part(job)
+        if not job.get('error'):
+            if stream_error == 'cancelled' or job['cancel'].is_set():
+                job['error'] = 'cancelled'
+            elif stream_error:
+                job['error'] = f'segment download failed: {stream_error}'
+            else:
+                job['error'] = f'ffmpeg exited with code {rc}'
+
+    job['returncode'] = rc
+    job['phase'] = 'done'
+    job['finished_at'] = time.time()          # set last: pollers key off it
+    try: os.remove(job['progress_path'])
+    except OSError: pass
+    with _player_procs_lock:
+        _player_procs.pop(p.pid, None)
+    sys.stderr.write(f'[native_host] ffmpeg finished pid={p.pid} rc={rc}\n')
+    _prune_mkv_jobs()
+
+def _start_ffmpeg_remux(job: dict, input_url: str, ffmpeg_path: str):
+    # -c copy: stream-copy all tracks (no re-encode). -f matroska: the output
+    # is written to a *.part temp name, so the format cannot be guessed from
+    # the extension. -progress <file>: machine-readable progress; stderr is
+    # discarded (no .log file). The protocol whitelist lets the loopback
+    # playlist reference remote AES keys / fMP4 init sections.
+    out  = job.get('output_path') or job['default_output_path']
+    part = out + '.part'
+    job['output_path'] = out
+    job['part_path']   = part
+    cmd = [
+        ffmpeg_path, '-hide_banner', '-loglevel', 'error', '-nostats',
+        '-protocol_whitelist', 'file,crypto,data,http,https,tcp,tls',
+        '-progress', job['progress_path'],
+        '-i', input_url, '-c', 'copy', '-f', 'matroska', '-y', part,
+    ]
+    proc = subprocess.Popen(
+        cmd, shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    job['pid'] = proc.pid
+    with _player_procs_lock:
+        _player_procs[proc.pid] = proc
+    threading.Thread(target=_watch_mkv, args=(proc, job), daemon=True).start()
+    if job['cancel'].is_set():
+        try: proc.terminate()
+        except Exception: pass
+
+def _run_mkv_job(job: dict, playlist_url: str, ffmpeg_path: str):
+    # 1) Ask where to save before spending any bandwidth.
+    if job.get('ask_path'):
+        job['phase'] = 'selecting'
+        path, cancelled = _ask_save_path(job['default_output_path'])
+        if job['cancel'].is_set() or cancelled:
+            _finish_mkv_job(job, -1, 'cancelled')
+            return
+        if path:
+            job['output_path'] = _normalize_output_path(path)
+        else:
+            # No dialog available (headless host) → keep the suggested path.
+            job['output_path'] = job['default_output_path']
+    if job['cancel'].is_set():
+        _finish_mkv_job(job, -1, 'cancelled')
+        return
+
+    # 2) Prefer the parallel RAM-buffered path; ffmpeg reads it over loopback.
+    job['phase'] = 'streaming'
+    server = None
+    try:
+        server, _store = _start_streaming_input(playlist_url, job)
+    except _StreamCancelled:
+        _finish_mkv_job(job, -1, 'cancelled')
+        return
+    except Exception as e:
+        sys.stderr.write(f'[native_host] playlist setup failed: {e}\n')
+
+    if job['cancel'].is_set():
+        _finish_mkv_job(job, -1, 'cancelled')
+        return
+
+    if server is None:
+        # Live / I-frame-only / unsupported: let ffmpeg read the stream itself.
+        job['phase'] = 'remuxing'
+        if not job.get('duration'):
+            threading.Thread(target=_probe_hls_duration,
+                             args=(job, playlist_url), daemon=True).start()
+        input_url = playlist_url
+    else:
+        input_url = server.url
+
+    try:
+        _start_ffmpeg_remux(job, input_url, ffmpeg_path)
+    except Exception as e:
+        _finish_mkv_job(job, -1, f'ffmpeg start failed: {e}')
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  NATIVE HOST  (async stdio loop)
@@ -992,12 +1795,17 @@ def native_host_loop():
             elif action == 'downloadMkv':
                 # Remux HLS playlist → MKV via ffmpeg (stream-copy, no re-encode).
                 # ffmpeg searched in: PATH → EXE directory → common install locations.
-                # Starts ffmpeg as a non-blocking subprocess; returns { success, pid, outputPath }
-                # immediately. Progress goes to a temp file via -progress and is
-                # polled from the browser through the 'getMkvProgress' action.
+                # The job thread asks the user where to save, then streams the
+                # segments through RAM (10 parallel downloads) into ffmpeg.
+                # Returns { success, jobId, outputPath, needsSavePath } at once;
+                # progress is polled via the 'getMkvProgress' action.
+                #
+                # Optional 'savePath' skips the Save-As dialog (used by tests and
+                # by callers that already know the destination).
                 playlist_url = msg.get('playlistUrl', '')
                 dl_title     = msg.get('title', 'video')
                 quality      = msg.get('quality', '')
+                save_path    = msg.get('savePath') or ''
                 if not playlist_url:
                     _reply({'success': False, 'error': 'Missing playlistUrl'}, seq)
                     return
@@ -1023,112 +1831,91 @@ def native_host_loop():
                     _reply({'success': False, 'error': 'ffmpeg not found — install ffmpeg and add it to PATH'}, seq)
                     return
 
-                # Build safe output filename (strip chars forbidden in Windows paths)
+                # Suggested filename (strip chars forbidden in Windows paths)
                 safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', dl_title).strip('_') or 'video'
                 if quality:
                     safe_title += f'_{quality}'
                 downloads_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
                 os.makedirs(downloads_dir, exist_ok=True)
-                output_path = os.path.join(downloads_dir, f'{safe_title}.mkv')
+                default_path = os.path.join(downloads_dir, f'{safe_title}.mkv')
+                output_path  = _normalize_output_path(save_path) if save_path else None
 
                 # ffmpeg appends progress blocks to this file; the EXE parses
-                # them on demand. Removed when ffmpeg exits.
+                # them on demand. Removed when the job ends.
                 fd, progress_path = tempfile.mkstemp(prefix='stp_ffmpeg_', suffix='.progress')
                 os.close(fd)
 
-                # -c copy: stream-copy all tracks (no re-encode). -y: overwrite without prompt.
-                # -progress <file>: machine-readable progress. stderr → DEVNULL (no log file).
-                cmd_mkv = [
-                    ffmpeg_path, '-hide_banner', '-loglevel', 'error', '-nostats',
-                    '-progress', progress_path,
-                    '-i', playlist_url, '-c', 'copy', '-y', output_path,
-                ]
-                sys.stderr.write(f'[native_host] downloadMkv: {playlist_url} → {output_path}\n')
-
-                # CREATE_NO_WINDOW prevents a console window from flashing on screen.
                 _prune_mkv_jobs()
-                try:
-                    proc = subprocess.Popen(
-                        cmd_mkv, shell=False,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-                except Exception:
-                    try: os.remove(progress_path)
-                    except OSError: pass
-                    raise
-
-                pid = proc.pid
                 job = {
-                    'pid':           pid,
-                    'output_path':   output_path,
-                    'progress_path': progress_path,
-                    'started_at':    time.time(),
-                    'finished_at':   None,
-                    'returncode':    None,
-                    'duration':      None,
-                    'live':          False,
-                    'out_time':      0.0,
-                    'error':         None,
+                    'job_id':          _next_mkv_job_id(),
+                    'pid':             None,
+                    'output_path':     output_path,
+                    'default_output_path': default_path,
+                    'part_path':       None,
+                    'ask_path':        not save_path,
+                    'progress_path':   progress_path,
+                    'started_at':      time.time(),
+                    'finished_at':     None,
+                    'returncode':      None,
+                    'phase':           'preparing',
+                    'duration':        None,
+                    'live':            False,
+                    'out_time':        0.0,
+                    'segments_total':  0,
+                    'segments_done':   0,
+                    'download_bytes':  0,
+                    'buffered_bytes':  0,
+                    'store':           None,
+                    'server':          None,
+                    'stream_error':    None,
+                    'stat_lock':       threading.Lock(),
+                    'cancel':          threading.Event(),
+                    'error':           None,
                 }
                 with _mkv_jobs_lock:
-                    _mkv_jobs[pid] = job
-                with _player_procs_lock:
-                    _player_procs[pid] = proc
+                    _mkv_jobs[job['job_id']] = job
 
-                # Duration for the progress bar (only VOD playlists have ENDLIST).
-                def _probe_duration(j, u):
-                    try:
-                        duration, is_live = _hls_duration(u)
-                        j['duration'] = duration
-                        j['live']     = is_live
-                    except Exception as e:
-                        sys.stderr.write(f'[native_host] duration probe failed: {e}\n')
-                threading.Thread(target=_probe_duration, args=(job, playlist_url), daemon=True).start()
-
-                def _watch_mkv(p, k, j):
-                    p.wait()
-                    try:
-                        prog = _read_ffmpeg_progress(j['progress_path'])
-                        j['out_time'] = _ffmpeg_out_time(prog)
-                    except Exception:
-                        pass
-                    rc = p.returncode
-                    if rc is not None and rc > 0x7FFFFFFF:   # Windows: show -2, not 4294967294
-                        rc -= 0x100000000
-                    j['returncode']  = rc
-                    if rc != 0:
-                        j['error'] = f'ffmpeg exited with code {rc}'
-                    j['finished_at'] = time.time()          # set last: pollers key off it
-                    try: os.remove(j['progress_path'])
-                    except OSError: pass
-                    with _player_procs_lock:
-                        _player_procs.pop(k, None)
-                    sys.stderr.write(f'[native_host] ffmpeg finished pid={k} rc={rc}\n')
-                    _prune_mkv_jobs()
-                threading.Thread(target=_watch_mkv, args=(proc, pid, job), daemon=True).start()
-                _reply({'success': True, 'pid': pid, 'outputPath': output_path}, seq)
+                sys.stderr.write(
+                    f'[native_host] downloadMkv #{job["job_id"]}: '
+                    f'{playlist_url} → {output_path or default_path}\n'
+                )
+                threading.Thread(
+                    target=_run_mkv_job,
+                    args=(job, playlist_url, ffmpeg_path),
+                    daemon=True,
+                ).start()
+                _reply({'success': True, 'jobId': job['job_id'], 'pid': None,
+                        'outputPath': output_path,
+                        'suggestedOutputPath': default_path,
+                        'needsSavePath': not save_path}, seq)
 
             elif action == 'getMkvProgress':
-                # Poll ffmpeg's -progress temp file for one remux job.
-                # { pid } → { success, state, percent, outTime, duration, size,
-                #              speed, eta, elapsed, live, outputPath, error }
-                pid = msg.get('pid')
-                try:
-                    pid = int(pid) if pid is not None else None
-                except (TypeError, ValueError):
-                    pid = None
-                with _mkv_jobs_lock:
-                    if pid:
-                        job = _mkv_jobs.get(pid)
-                    else:
-                        job = max(_mkv_jobs.values(), key=lambda j: j['started_at']) if _mkv_jobs else None
+                # Poll one remux job.
+                # { jobId | pid } → { success, state, phase, percent, outTime,
+                #     duration, size, speed, eta, elapsed, live, segmentsDone,
+                #     segmentsTotal, outputPath, error }
+                jid = _as_int(msg.get('jobId'))
+                pid = _as_int(msg.get('pid'))
+                job = _find_mkv_job(jid, pid, newest_if_none=True)
                 if job is None:
                     _reply({'success': False, 'state': 'unknown', 'error': 'Unknown download'}, seq)
                 else:
                     _reply(_mkv_progress_snapshot(job), seq)
+
+            elif action == 'stopMkv':
+                # Cancel a remux job: aborts prefetch and/or terminates ffmpeg.
+                jid = _as_int(msg.get('jobId'))
+                pid = _as_int(msg.get('pid'))
+                job = _find_mkv_job(jid, pid)
+                if job is not None:
+                    job['cancel'].set()
+                    with _player_procs_lock:
+                        proc = _player_procs.get(job.get('pid'))
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                    _stop_job_stream(job)        # free the RAM buffer right away
+                    sys.stderr.write(f'[native_host] stopMkv #{job["job_id"]}\n')
+                _reply({'success': True}, seq)
 
             elif action == 'dlnaCast':
                 cast_url = msg.get('castUrl', '')
