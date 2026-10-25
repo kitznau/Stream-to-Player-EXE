@@ -870,6 +870,50 @@ def _probe_hls_duration(job: dict, url: str):
     except Exception as e:
         sys.stderr.write(f'[native_host] duration probe failed: {e}\n')
 
+_HLS_URL_RE     = re.compile(r'\.m3u8?($|[?#])', re.I)
+_MEDIA_FILE_RE  = re.compile(r'\.(mp4|m4v|webm|mkv|mov|avi|flv|3gp)($|[?#])', re.I)
+
+def _looks_like_hls(url: str) -> bool:
+    """True for playlist URLs, False for direct media files (MP4, WebM, …).
+
+    ARD Mediathek and similar sites expose both: the adaptive player uses an
+    .m3u8 playlist, while canPlayType fallback / direct links point at a plain
+    .mp4. A URL with no recognisable extension is treated as a playlist —
+    ffmpeg's HLS probe then decides, and a non-playlist simply falls back."""
+    u = url or ''
+    if _HLS_URL_RE.search(u):
+        return True
+    return not _MEDIA_FILE_RE.search(u)
+
+def _probe_media_duration(job: dict, url: str, ffmpeg_path: str):
+    """Best-effort duration of a direct media file (ffprobe next to ffmpeg)."""
+    probe = None
+    if ffmpeg_path:
+        cand = os.path.join(
+            os.path.dirname(ffmpeg_path),
+            'ffprobe.exe' if os.name == 'nt' else 'ffprobe',
+        )
+        if os.path.isfile(cand):
+            probe = cand
+    if not probe:
+        probe = shutil.which('ffprobe')
+    if not probe:
+        return
+    try:
+        res = subprocess.run(
+            [probe, '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=nw=1:nk=1', url],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        lines = [ln.strip() for ln in (res.stdout or '').splitlines() if ln.strip()]
+        if lines:
+            dur = float(lines[0])
+            if dur > 0:
+                job['duration'] = dur
+    except Exception as e:
+        sys.stderr.write(f'[native_host] ffprobe duration failed: {e}\n')
+
 def _playlist_for_server(text: str, base_url: str, names: list) -> str:
     """Rewrite a media playlist so segments point at the local RAM server.
 
@@ -1275,8 +1319,17 @@ def _start_streaming_input(playlist_url: str, job: dict):
     return server, store
 
 def _normalize_output_path(path: str) -> str:
+    """Absolute path that always ends in .mkv.
+
+    The export is always Matroska (`-f matroska`), so a name typed with another
+    extension ("Ard Test.mp4") would create a file whose name lies about its
+    contents. Real extensions are replaced; a dot inside the title ("Mr. Robot")
+    is kept and .mkv is appended instead."""
     path = os.path.abspath(os.path.expanduser((path or '').strip().strip('"')))
-    if not os.path.splitext(path)[1]:
+    root, ext = os.path.splitext(path)
+    if ext and re.fullmatch(r'\.[A-Za-z0-9]{1,4}', ext):
+        path = root + '.mkv'
+    else:
         path += '.mkv'
     parent = os.path.dirname(path)
     if parent:
@@ -1548,6 +1601,7 @@ def _start_ffmpeg_remux(job: dict, input_url: str, ffmpeg_path: str):
     cmd = [
         ffmpeg_path, '-hide_banner', '-loglevel', 'error', '-nostats',
         '-protocol_whitelist', 'file,crypto,data,http,https,tcp,tls',
+        '-user_agent', 'Mozilla/5.0',
         '-progress', job['progress_path'],
         '-i', input_url, '-c', 'copy', '-f', 'matroska', '-y', part,
     ]
@@ -1566,7 +1620,7 @@ def _start_ffmpeg_remux(job: dict, input_url: str, ffmpeg_path: str):
         try: proc.terminate()
         except Exception: pass
 
-def _run_mkv_job(job: dict, playlist_url: str, ffmpeg_path: str):
+def _run_mkv_job(job: dict, source_url: str, ffmpeg_path: str):
     # 1) Ask where to save before spending any bandwidth.
     if job.get('ask_path'):
         job['phase'] = 'selecting'
@@ -1583,28 +1637,36 @@ def _run_mkv_job(job: dict, playlist_url: str, ffmpeg_path: str):
         _finish_mkv_job(job, -1, 'cancelled')
         return
 
-    # 2) Prefer the parallel RAM-buffered path; ffmpeg reads it over loopback.
-    job['phase'] = 'streaming'
+    # 2) HLS playlists are streamed through the parallel RAM buffer. Direct
+    #    media files (MP4/WebM/…, e.g. the ARD Mediathek progressive links) are
+    #    just remuxed by ffmpeg from the URL — no segments to pipeline.
     server = None
-    try:
-        server, _store = _start_streaming_input(playlist_url, job)
-    except _StreamCancelled:
-        _finish_mkv_job(job, -1, 'cancelled')
-        return
-    except Exception as e:
-        sys.stderr.write(f'[native_host] playlist setup failed: {e}\n')
+    if _looks_like_hls(source_url):
+        job['phase'] = 'streaming'
+        try:
+            server, _store = _start_streaming_input(source_url, job)
+        except _StreamCancelled:
+            _finish_mkv_job(job, -1, 'cancelled')
+            return
+        except Exception as e:
+            sys.stderr.write(f'[native_host] playlist setup failed: {e}\n')
+    else:
+        job['phase'] = 'remuxing'
+        threading.Thread(target=_probe_media_duration,
+                         args=(job, source_url, ffmpeg_path), daemon=True).start()
 
     if job['cancel'].is_set():
         _finish_mkv_job(job, -1, 'cancelled')
         return
 
     if server is None:
-        # Live / I-frame-only / unsupported: let ffmpeg read the stream itself.
+        # Live / I-frame-only / unsupported / direct file: ffmpeg reads the
+        # stream itself.
         job['phase'] = 'remuxing'
-        if not job.get('duration'):
+        if job.get('duration') is None and _looks_like_hls(source_url):
             threading.Thread(target=_probe_hls_duration,
-                             args=(job, playlist_url), daemon=True).start()
-        input_url = playlist_url
+                             args=(job, source_url), daemon=True).start()
+        input_url = source_url
     else:
         input_url = server.url
 
@@ -1793,16 +1855,20 @@ def native_host_loop():
                     _reply({'state': 'running' if proc.poll() is None else 'stopped'}, seq)
 
             elif action == 'downloadMkv':
-                # Remux HLS playlist → MKV via ffmpeg (stream-copy, no re-encode).
+                # Remux any video source → MKV via ffmpeg (stream-copy, no re-encode).
                 # ffmpeg searched in: PATH → EXE directory → common install locations.
-                # The job thread asks the user where to save, then streams the
-                # segments through RAM (10 parallel downloads) into ffmpeg.
+                # The job thread asks the user where to save, then:
+                #   • .m3u8 playlist → segments stream through RAM (10 parallel
+                #     downloads) into ffmpeg;
+                #   • direct media file (.mp4/.webm, e.g. ARD Mediathek's
+                #     progressive links) → ffmpeg reads the URL itself.
                 # Returns { success, jobId, outputPath, needsSavePath } at once;
                 # progress is polled via the 'getMkvProgress' action.
                 #
                 # Optional 'savePath' skips the Save-As dialog (used by tests and
                 # by callers that already know the destination).
-                playlist_url = msg.get('playlistUrl', '')
+                playlist_url = (msg.get('playlistUrl') or msg.get('mediaUrl')
+                                or msg.get('url') or '')
                 dl_title     = msg.get('title', 'video')
                 quality      = msg.get('quality', '')
                 save_path    = msg.get('savePath') or ''
