@@ -885,6 +885,53 @@ def _looks_like_hls(url: str) -> bool:
         return True
     return not _MEDIA_FILE_RE.search(u)
 
+def _winget_ffmpeg_candidates() -> list:
+    """ffmpeg.exe installed by WinGet (Gyan.FFmpeg), independent of PATH.
+
+    WinGet normally drops a shim into %LOCALAPPDATA%\\Microsoft\\WinGet\\Links,
+    but that folder is not always on PATH (and a broken PATH silently hides it),
+    so the package itself is probed as well."""
+    local = os.environ.get('LOCALAPPDATA') or os.path.join(
+        os.path.expanduser('~'), 'AppData', 'Local')
+    out = [os.path.join(local, 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe')]
+    packages = os.path.join(local, 'Microsoft', 'WinGet', 'Packages')
+    try:
+        names = os.listdir(packages)
+    except OSError:
+        return out
+    for name in names:
+        if 'ffmpeg' not in name.lower():
+            continue
+        root = os.path.join(packages, name)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath[len(root):].count(os.sep) >= 4:   # <pkg>\<build>\bin\*
+                dirnames[:] = []
+                continue
+            if 'ffmpeg.exe' in filenames:
+                out.append(os.path.join(dirpath, 'ffmpeg.exe'))
+    return out
+
+def _find_ffmpeg() -> str | None:
+    """First usable ffmpeg.exe: PATH → EXE dir → common installs → WinGet."""
+    found = shutil.which('ffmpeg')
+    if found:
+        return found
+
+    exe_dir = os.path.dirname(os.path.abspath(
+        sys.executable if getattr(sys, 'frozen', False) else __file__))
+    candidates = [
+        os.path.join(exe_dir, 'ffmpeg.exe'),
+        r'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
+        r'C:\ffmpeg\bin\ffmpeg.exe',
+        r'C:\ProgramData\chocolatey\bin\ffmpeg.exe',
+        r'C:\ProgramData\scoop\shims\ffmpeg.exe',
+    ]
+    candidates += _winget_ffmpeg_candidates()
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
 def _probe_media_duration(job: dict, url: str, ffmpeg_path: str):
     """Best-effort duration of a direct media file (ffprobe next to ffmpeg)."""
     probe = None
@@ -1876,25 +1923,13 @@ def native_host_loop():
                     _reply({'success': False, 'error': 'Missing playlistUrl'}, seq)
                     return
 
-                # Locate ffmpeg binary
-                ffmpeg_path = shutil.which('ffmpeg')
-                if not ffmpeg_path:
-                    _exe_dir = os.path.dirname(os.path.abspath(
-                        sys.executable if getattr(sys, 'frozen', False) else __file__
-                    ))
-                    for cand in [
-                        os.path.join(_exe_dir, 'ffmpeg.exe'),
-                        r'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
-                        r'C:\ffmpeg\bin\ffmpeg.exe',
-                        r'C:\ProgramData\chocolatey\bin\ffmpeg.exe',
-                        r'C:\ProgramData\scoop\shims\ffmpeg.exe',
-                    ]:
-                        if os.path.isfile(cand):
-                            ffmpeg_path = cand
-                            break
+                # Locate ffmpeg binary (PATH → EXE dir → common installs → WinGet)
+                ffmpeg_path = _find_ffmpeg()
 
                 if not ffmpeg_path:
-                    _reply({'success': False, 'error': 'ffmpeg not found — install ffmpeg and add it to PATH'}, seq)
+                    _reply({'success': False,
+                            'error': 'ffmpeg not found — install it (winget install Gyan.FFmpeg) '
+                                     'or put ffmpeg.exe next to this EXE'}, seq)
                     return
 
                 # Suggested filename (strip chars forbidden in Windows paths)
